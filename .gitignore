@@ -1,0 +1,13 @@
+/target/
+Cargo.lock
+Gemfile.lock
+/.bundle/
+/pkg/
+/tmp/
+/lib/refresh_machines_native/
+/ext/**/Makefile
+/ext/**/mkmf.log
+/ext/**/*.bundle
+/ext/**/*.so
+/ext/**/*.dSYM/
+*.gem

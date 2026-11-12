@@ -1,0 +1,89 @@
+module RefreshMachines
+  VERSION: String
+
+  type state = :fresh | :stale | :expired
+  type refusal = :time_regressed | :rejected | :entries_full | :flights_full
+               | :waiters_full | :exhausted | :stale
+
+  class Policy < Data
+    attr_reader fresh_for: Integer
+    attr_reader stale_while_revalidate: Integer
+    attr_reader stale_if_error: Integer
+    def self.new: (Integer fresh_for, Integer stale_while_revalidate, Integer stale_if_error) -> Policy
+                | (fresh_for: Integer, stale_while_revalidate: Integer, stale_if_error: Integer) -> Policy
+    def state: (Integer age) -> state
+    def while_revalidate?: (Integer age) -> bool
+    def if_error?: (Integer age) -> bool
+  end
+
+  class Fresh < Data
+    attr_reader age: Integer
+    def self.new: (Integer age) -> Fresh
+                | (age: Integer) -> Fresh
+  end
+
+  class Stale < Data
+    type revalidation = :lead | :in_flight | :backoff | :flights_full | :exhausted
+
+    attr_reader age: Integer
+    attr_reader revalidation: revalidation
+    attr_reader lease_id: Integer?
+    attr_reader retry_at: Integer?
+    def self.new: (Integer age, revalidation revalidation, Integer? lease_id, Integer? retry_at) -> Stale
+                | (age: Integer, revalidation: revalidation, lease_id: Integer?, retry_at: Integer?) -> Stale
+  end
+
+  class Fetch < Data
+    attr_reader lease_id: Integer
+    attr_reader key: Integer
+    def self.new: (Integer lease_id, Integer key) -> Fetch
+                | (lease_id: Integer, key: Integer) -> Fetch
+  end
+
+  class Wait < Data
+    attr_reader waiter_id: Integer
+    attr_reader key: Integer
+    def self.new: (Integer waiter_id, Integer key) -> Wait
+                | (waiter_id: Integer, key: Integer) -> Wait
+  end
+
+  class Notification < Data
+    type outcome = :completed | :abandoned
+
+    attr_reader waiter_id: Integer
+    attr_reader key: Integer
+    attr_reader outcome: outcome
+    def self.new: (Integer waiter_id, Integer key, outcome outcome) -> Notification
+                | (waiter_id: Integer, key: Integer, outcome: outcome) -> Notification
+  end
+
+  class Refresher
+    CAPACITY: Integer
+    FLIGHT_CAPACITY: Integer
+    WAITER_CAPACITY: Integer
+
+    def self.new: () -> Refresher
+    def decide: (Integer key, Integer now, Integer lead_for) -> (Fresh | Stale | Fetch | Wait | refusal)
+    def store: (Integer lease_id, Integer now, Integer age, Policy policy) -> (:stored | refusal)
+    def fail: (Integer lease_id, Integer now, Integer retry_after) -> (Integer | nil | refusal)
+    def abandon: (Integer lease_id) -> (:abandoned | :stale)
+    def reap: (Integer now) -> (Integer | :time_regressed)
+    def put: (Integer key, Integer now, Integer age, Policy policy) -> (:stored | refusal)
+    def forget: (Integer key) -> bool
+    def sweep: (Integer now, Integer max) -> (Array[Integer] | :time_regressed)
+    def cancel: (Integer waiter_id) -> (:cancelled | :stale)
+    def drain: (Integer max) -> Array[Notification]
+    def age: (Integer key, Integer now) -> Integer?
+    def state: (Integer key, Integer now) -> state?
+    def stale_if_error: (Integer key, Integer now) -> Integer?
+    def leading: (Integer key) -> Integer?
+    def now: () -> Integer
+    def size: () -> Integer
+    def in_flight: () -> Integer
+    def waiting: () -> Integer
+    def pending: () -> Integer
+    def capacity: () -> Integer
+    def flight_capacity: () -> Integer
+    def waiter_capacity: () -> Integer
+  end
+end
