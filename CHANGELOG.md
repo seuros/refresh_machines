@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.3.0](https://github.com/seuros/refresh_machines/compare/refresh_machines/v0.2.0...refresh_machines/v0.3.0) (2026-11-13)
+
+
+### ⚠ BREAKING CHANGES
+
+* see CONVENTIONS: one exhaustive Refusal per crate, Result from every mutator, honoured idempotent repeats only when provable, Duration time, Ruby mirrors the core. No compatibility aliases. Requires coalesce-machines >= 0.5. Ruby times are Integer nanoseconds; the Refused alias is gone.
+
+### Features
+
+* Duration instants and spans, Wait names its flight, forget answers Forgetting, Ruby mirrors Decision and Revalidation ([f275b16](https://github.com/seuros/refresh_machines/commit/f275b1663bed9b658d6477a5542886c230946b90))
+
 ## [0.2.0](https://github.com/seuros/refresh_machines/compare/refresh_machines/v0.1.2...refresh_machines/v0.2.0) (2026-11-13)
 
 
