@@ -1,17 +1,14 @@
 //! Thin binding to the bounded freshness and refresh-lease policy.
 mod init;
 
-use std::cell::RefCell;
+use std::{cell::RefCell, time::Duration};
 
 use magnus::{
-    Error, Integer, RArray, RClass, Ruby, Symbol, TryConvert, Value,
-    prelude::*,
-    scan_args::{get_kwargs, scan_args},
-    typed_data::Obj,
+    Error, Integer, RArray, RClass, Ruby, Symbol, TryConvert, Value, prelude::*, typed_data::Obj,
 };
 use refresh_machines::{
-    Decision, FlightId, Lease, Notification, Outcome, Policy, Refresher as Core, Refusal,
-    Revalidation, State, WaiterId,
+    Decision, FlightId, Forgetting, Lease, Notification, Outcome, Policy, Refresher as Core,
+    Refusal, Revalidation, State, WaiterId,
 };
 
 const KEY_CAPACITY: usize = 256;
@@ -33,21 +30,44 @@ impl TryConvert for Number {
     }
 }
 
-/// The optional `scope:` keyword of a constructor; zero when omitted.
-fn scope_keyword(ruby: &Ruby, args: &[Value]) -> Result<u16, Error> {
-    let args = scan_args::<(), (), (), (), _, ()>(args)?;
-    let keywords = get_kwargs::<_, (), (Option<Value>,), ()>(args.keywords, &[], &["scope"])?;
-    let Some(value) = keywords.optional.0 else {
-        return Ok(0);
-    };
-    if Integer::from_value(value).is_none() {
-        return Err(Error::new(
-            ruby.exception_type_error(),
-            "scope must be an Integer",
-        ));
+/// An instant or a span: Integer nanoseconds in `0..2**64-1`.
+#[derive(Clone, Copy)]
+struct Nanos(Duration);
+
+impl TryConvert for Nanos {
+    fn try_convert(value: Value) -> Result<Self, Error> {
+        if Integer::from_value(value).is_none() {
+            return Err(Error::new(
+                Ruby::get_with(value).exception_type_error(),
+                "expected Integer nanoseconds",
+            ));
+        }
+        u64::try_convert(value).map(|nanos| Self(Duration::from_nanos(nanos)))
     }
-    u16::try_convert(value)
-        .map_err(|_| Error::new(ruby.exception_range_error(), "scope must be in 0..=65535"))
+}
+
+/// A duration as Integer nanoseconds, exact however large.
+fn nanos(ruby: &Ruby, duration: Duration) -> Integer {
+    ruby.integer_from_u128(duration.as_nanos())
+}
+
+/// A scope: an Integer in `0..=65535`.
+#[derive(Clone, Copy)]
+struct Scope(u16);
+
+impl TryConvert for Scope {
+    fn try_convert(value: Value) -> Result<Self, Error> {
+        let ruby = Ruby::get_with(value);
+        if Integer::from_value(value).is_none() {
+            return Err(Error::new(
+                ruby.exception_type_error(),
+                "scope must be an Integer",
+            ));
+        }
+        u16::try_convert(value)
+            .map(Self)
+            .map_err(|_| Error::new(ruby.exception_range_error(), "scope must be in 0..=65535"))
+    }
 }
 
 /// A `RefreshMachines::Policy`, read field by field so every one is validated.
@@ -64,9 +84,9 @@ impl TryConvert for Rules {
                 "expected a RefreshMachines::Policy",
             ));
         }
-        let field = |name: &str| -> Result<u64, Error> {
+        let field = |name: &str| -> Result<Duration, Error> {
             let raw: Value = value.funcall(name, ())?;
-            Number::try_convert(raw).map(|number| number.0)
+            Nanos::try_convert(raw).map(|nanos| nanos.0)
         };
         Ok(Self(Policy::new(
             field("fresh_for")?,
@@ -76,6 +96,7 @@ impl TryConvert for Rules {
     }
 }
 
+/// Ruby symbol name of a refusal: the snake case of the core variant.
 const fn refusal_name(refused: Refusal) -> &'static str {
     match refused {
         Refusal::TimeRegressed => "time_regressed",
@@ -84,7 +105,7 @@ const fn refusal_name(refused: Refusal) -> &'static str {
         Refusal::FlightsFull => "flights_full",
         Refusal::WaitersFull => "waiters_full",
         Refusal::Exhausted => "exhausted",
-        _ => "stale",
+        Refusal::Stale => "stale",
     }
 }
 
@@ -111,15 +132,26 @@ fn data(ruby: &Ruby, name: &str) -> Result<Value, Error> {
     ruby.define_module("RefreshMachines")?.const_get(name)
 }
 
-fn policy_state(ruby: &Ruby, this: Value, age: Number) -> Result<Symbol, Error> {
+fn notification(ruby: &Ruby, class: Value, note: Notification) -> Result<Value, Error> {
+    let outcome = ruby.to_symbol(match note.outcome {
+        Outcome::Completed => "completed",
+        Outcome::Abandoned => "abandoned",
+    });
+    class.funcall(
+        "new",
+        (note.waiter.raw(), note.flight.raw(), note.key, outcome),
+    )
+}
+
+fn policy_state(ruby: &Ruby, this: Value, age: Nanos) -> Result<Symbol, Error> {
     Ok(state_name(ruby, Rules::try_convert(this)?.0.state(age.0)))
 }
 
-fn policy_while_revalidate(this: Value, age: Number) -> Result<bool, Error> {
+fn policy_while_revalidate(this: Value, age: Nanos) -> Result<bool, Error> {
     Ok(Rules::try_convert(this)?.0.while_revalidate(age.0))
 }
 
-fn policy_if_error(this: Value, age: Number) -> Result<bool, Error> {
+fn policy_if_error(this: Value, age: Nanos) -> Result<bool, Error> {
     Ok(Rules::try_convert(this)?.0.if_error(age.0))
 }
 
@@ -129,10 +161,16 @@ struct Refresher {
 }
 
 impl Refresher {
-    fn new(ruby: &Ruby, args: &[Value]) -> Result<Self, Error> {
-        Ok(Self {
-            core: RefCell::new(Core::with_scope(scope_keyword(ruby, args)?)),
-        })
+    const fn new() -> Self {
+        Self {
+            core: RefCell::new(Core::new()),
+        }
+    }
+
+    const fn with_scope(scope: Scope) -> Self {
+        Self {
+            core: RefCell::new(Core::with_scope(scope.0)),
+        }
     }
 
     fn scope(&self) -> u16 {
@@ -143,33 +181,39 @@ impl Refresher {
         ruby: &Ruby,
         this: Obj<Self>,
         key: Number,
-        now: Number,
-        lead_for: Number,
+        now: Nanos,
+        lead_for: Nanos,
     ) -> Result<Value, Error> {
         this.check_frozen()?;
         // Resolve the classes before deciding, so a failure registers nothing.
+        let class = |name| data(ruby, name);
         let classes = (
-            data(ruby, "Fresh")?,
-            data(ruby, "Stale")?,
-            data(ruby, "Fetch")?,
-            data(ruby, "Wait")?,
+            class("Fresh")?,
+            class("Stale")?,
+            class("Fetch")?,
+            class("Wait")?,
         );
+        let parts = (class("Lead")?, class("Backoff")?, class("Unavailable")?);
         let decision = this.core.borrow_mut().decide(key.0, now.0, lead_for.0);
         match decision {
-            Ok(Decision::Fresh { age }) => classes.0.funcall("new", (age,)),
+            Ok(Decision::Fresh { age }) => classes.0.funcall("new", (nanos(ruby, age),)),
             Ok(Decision::Stale { age, revalidation }) => {
-                let (name, lease, retry_at) = match revalidation {
-                    Revalidation::Lead(lease) => ("lead", Some(lease.raw()), None),
-                    Revalidation::InFlight => ("in_flight", None, None),
-                    Revalidation::Backoff { until } => ("backoff", None, Some(until)),
-                    Revalidation::Unavailable(refused) => (refusal_name(refused), None, None),
+                let revalidation: Value = match revalidation {
+                    Revalidation::Lead(lease) => parts.0.funcall("new", (lease.raw(),))?,
+                    Revalidation::InFlight => ruby.to_symbol("in_flight").as_value(),
+                    Revalidation::Backoff { until } => {
+                        parts.1.funcall("new", (nanos(ruby, until),))?
+                    }
+                    Revalidation::Unavailable(refused) => {
+                        parts.2.funcall("new", (refusal(ruby, refused),))?
+                    }
                 };
-                classes
-                    .1
-                    .funcall("new", (age, ruby.to_symbol(name), lease, retry_at))
+                classes.1.funcall("new", (nanos(ruby, age), revalidation))
             }
-            Ok(Decision::Fetch { lease }) => classes.2.funcall("new", (lease.raw(), key.0)),
-            Ok(Decision::Wait { waiter }) => classes.3.funcall("new", (waiter.raw(), key.0)),
+            Ok(Decision::Fetch { lease }) => classes.2.funcall("new", (lease.raw(),)),
+            Ok(Decision::Wait { waiter, flight }) => {
+                classes.3.funcall("new", (waiter.raw(), flight.raw()))
+            }
             Err(refused) => Ok(refusal(ruby, refused)),
         }
     }
@@ -177,45 +221,45 @@ impl Refresher {
     fn store(
         ruby: &Ruby,
         this: Obj<Self>,
-        lease_id: Number,
-        now: Number,
-        age: Number,
+        lease: Number,
+        now: Nanos,
+        age: Nanos,
         policy: Rules,
     ) -> Result<Value, Error> {
         this.check_frozen()?;
         let outcome =
             this.core
                 .borrow_mut()
-                .store(Lease::from_raw(lease_id.0), now.0, age.0, policy.0);
+                .store(Lease::from_raw(lease.0), now.0, age.0, policy.0);
         Ok(done(ruby, outcome, "stored"))
     }
 
     fn fail(
         ruby: &Ruby,
         this: Obj<Self>,
-        lease_id: Number,
-        now: Number,
-        retry_after: Number,
+        lease: Number,
+        now: Nanos,
+        retry_after: Nanos,
     ) -> Result<Value, Error> {
         this.check_frozen()?;
-        let outcome =
-            this.core
-                .borrow_mut()
-                .fail(Lease::from_raw(lease_id.0), now.0, retry_after.0);
+        let outcome = this
+            .core
+            .borrow_mut()
+            .fail(Lease::from_raw(lease.0), now.0, retry_after.0);
         Ok(match outcome {
-            Ok(Some(age)) => ruby.integer_from_u64(age).as_value(),
+            Ok(Some(age)) => nanos(ruby, age).as_value(),
             Ok(None) => ruby.qnil().as_value(),
             Err(refused) => refusal(ruby, refused),
         })
     }
 
-    fn abandon(ruby: &Ruby, this: Obj<Self>, lease_id: Number) -> Result<Value, Error> {
+    fn abandon(ruby: &Ruby, this: Obj<Self>, lease: Number) -> Result<Value, Error> {
         this.check_frozen()?;
-        let outcome = this.core.borrow_mut().abandon(Lease::from_raw(lease_id.0));
+        let outcome = this.core.borrow_mut().abandon(Lease::from_raw(lease.0));
         Ok(done(ruby, outcome, "abandoned"))
     }
 
-    fn reap(ruby: &Ruby, this: Obj<Self>, now: Number) -> Result<Value, Error> {
+    fn reap(ruby: &Ruby, this: Obj<Self>, now: Nanos) -> Result<Value, Error> {
         this.check_frozen()?;
         let outcome = this.core.borrow_mut().reap(now.0);
         Ok(match outcome {
@@ -228,8 +272,8 @@ impl Refresher {
         ruby: &Ruby,
         this: Obj<Self>,
         key: Number,
-        now: Number,
-        age: Number,
+        now: Nanos,
+        age: Nanos,
         policy: Rules,
     ) -> Result<Value, Error> {
         this.check_frozen()?;
@@ -237,12 +281,16 @@ impl Refresher {
         Ok(done(ruby, outcome, "stored"))
     }
 
-    fn forget(this: Obj<Self>, key: Number) -> Result<bool, Error> {
+    fn forget(ruby: &Ruby, this: Obj<Self>, key: Number) -> Result<Symbol, Error> {
         this.check_frozen()?;
-        Ok(this.core.borrow_mut().forget(key.0))
+        let forgetting = this.core.borrow_mut().forget(key.0);
+        Ok(ruby.to_symbol(match forgetting {
+            Forgetting::Forgotten => "forgotten",
+            Forgetting::NotHeld => "not_held",
+        }))
     }
 
-    fn sweep(ruby: &Ruby, this: Obj<Self>, now: Number, max: Number) -> Result<Value, Error> {
+    fn sweep(ruby: &Ruby, this: Obj<Self>, now: Nanos, max: Number) -> Result<Value, Error> {
         this.check_frozen()?;
         let room = usize::try_from(max.0).map_or(KEY_CAPACITY, |max| max.min(KEY_CAPACITY));
         let mut buffer = [0_u64; KEY_CAPACITY];
@@ -258,13 +306,20 @@ impl Refresher {
         Ok(keys.as_value())
     }
 
-    fn cancel(ruby: &Ruby, this: Obj<Self>, waiter_id: Number) -> Result<Value, Error> {
+    fn cancel(ruby: &Ruby, this: Obj<Self>, waiter: Number) -> Result<Value, Error> {
         this.check_frozen()?;
-        let outcome = this
-            .core
-            .borrow_mut()
-            .cancel(WaiterId::from_raw(waiter_id.0));
+        let outcome = this.core.borrow_mut().cancel(WaiterId::from_raw(waiter.0));
         Ok(done(ruby, outcome, "cancelled"))
+    }
+
+    fn poll(ruby: &Ruby, this: Obj<Self>) -> Result<Option<Value>, Error> {
+        this.check_frozen()?;
+        // Resolve the class before taking anything, so a failure loses nothing.
+        let class = data(ruby, "Notification")?;
+        let polled = this.core.borrow_mut().poll();
+        polled
+            .map(|note| notification(ruby, class, note))
+            .transpose()
     }
 
     fn drain(ruby: &Ruby, this: Obj<Self>, max: Number) -> Result<RArray, Error> {
@@ -276,49 +331,47 @@ impl Refresher {
         let written = this.core.borrow_mut().drain(&mut buffer[..room]);
         let notifications = ruby.ary_new_capa(written);
         for note in buffer.iter().take(written) {
-            let outcome = ruby.to_symbol(match note.outcome {
-                Outcome::Completed => "completed",
-                Outcome::Abandoned => "abandoned",
-            });
-            let value: Value = class.funcall(
-                "new",
-                (note.waiter.raw(), note.flight.raw(), note.key, outcome),
-            )?;
-            notifications.push(value)?;
+            notifications.push(notification(ruby, class, *note)?)?;
         }
         Ok(notifications)
     }
 
-    fn age(&self, key: Number, now: Number) -> Option<u64> {
-        self.core.borrow().age(key.0, now.0)
+    fn age(ruby: &Ruby, this: &Self, key: Number, now: Nanos) -> Option<Integer> {
+        let age = this.core.borrow().age(key.0, now.0)?;
+        Some(nanos(ruby, age))
     }
 
-    fn state(ruby: &Ruby, this: &Self, key: Number, now: Number) -> Option<Symbol> {
+    fn state(ruby: &Ruby, this: &Self, key: Number, now: Nanos) -> Option<Symbol> {
         let state = this.core.borrow().state(key.0, now.0)?;
         Some(state_name(ruby, state))
     }
 
-    fn stale_if_error(&self, key: Number, now: Number) -> Option<u64> {
-        self.core.borrow().stale_if_error(key.0, now.0)
+    fn stale_if_error(ruby: &Ruby, this: &Self, key: Number, now: Nanos) -> Option<Integer> {
+        let age = this.core.borrow().stale_if_error(key.0, now.0)?;
+        Some(nanos(ruby, age))
     }
 
     fn leading(&self, key: Number) -> Option<u64> {
         self.core.borrow().leading(key.0).map(Lease::raw)
     }
 
-    fn flight(&self, lease_id: Number) -> Option<u64> {
+    fn flight(&self, lease: Number) -> Option<u64> {
         self.core
             .borrow()
-            .flight(Lease::from_raw(lease_id.0))
+            .flight(Lease::from_raw(lease.0))
             .map(FlightId::raw)
     }
 
-    fn now(&self) -> u64 {
-        self.core.borrow().now()
+    fn now(ruby: &Ruby, this: &Self) -> Integer {
+        nanos(ruby, this.core.borrow().now())
     }
 
     fn size(&self) -> usize {
         self.core.borrow().len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.core.borrow().is_empty()
     }
 
     fn in_flight(&self) -> usize {

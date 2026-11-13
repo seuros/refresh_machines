@@ -9,7 +9,7 @@ struct Draw {
     key: u64,
     now: u64,
     lease: u64,
-    policy: Policy,
+    policy: [u64; 3],
     age: u64,
     regressed: bool,
 }
@@ -31,7 +31,7 @@ fn draw(rng: &mut Rng, model: &Model) -> Draw {
         key: rng.below(6),
         now,
         lease,
-        policy: Policy::new(rng.below(6), rng.below(6), rng.below(8)),
+        policy: [rng.below(6), rng.below(6), rng.below(8)],
         age: rng.below(4),
         regressed: now < model.now,
     }
@@ -43,7 +43,8 @@ fn step(rng: &mut Rng, refresher: &mut Core, model: &mut Model) {
         0..=7 => {
             let lead_for = rng.below(7);
             let expect = model.decide(d.key, d.now, lead_for);
-            let found = observe(refresher.decide(d.key, d.now, lead_for), model, d.key);
+            let found = refresher.decide(d.key, t(d.now), t(lead_for));
+            let found = observe(found, refresher, model, d.key);
             assert_eq!(found, expect, "decide({}, {}, {lead_for})", d.key, d.now);
         }
         8..=10 => store(refresher, model, &d),
@@ -57,7 +58,13 @@ fn step(rng: &mut Rng, refresher: &mut Core, model: &mut Model) {
         }
         14 => reap(refresher, model, &d),
         15 => put(refresher, model, &d),
-        16 => assert_eq!(refresher.forget(d.key), model.held.remove(&d.key).is_some()),
+        16 => {
+            let expected = match model.held.remove(&d.key) {
+                Some(_) => Forgetting::Forgotten,
+                None => Forgetting::NotHeld,
+            };
+            assert_eq!(refresher.forget(d.key), expected);
+        }
         17 => sweep(rng, refresher, model, &d),
         18 => cancel(rng, refresher, model),
         _ => drain(rng, refresher, model),
@@ -95,7 +102,10 @@ fn store(refresher: &mut Core, model: &mut Model, d: &Draw) {
         );
         model.now = now;
     }
-    assert_eq!(refresher.store(Lease(lease), now, age, policy), expect);
+    assert_eq!(
+        refresher.store(Lease(lease), t(now), t(age), rules(policy)),
+        expect
+    );
 }
 
 fn fail(rng: &mut Rng, refresher: &mut Core, model: &mut Model, d: &Draw) {
@@ -120,7 +130,10 @@ fn fail(rng: &mut Rng, refresher: &mut Core, model: &mut Model, d: &Draw) {
     } else {
         Err(Refusal::Stale)
     };
-    assert_eq!(refresher.fail(Lease(lease), now, retry_after), expect);
+    assert_eq!(
+        refresher.fail(Lease(lease), t(now), t(retry_after)),
+        expect.map(|age| age.map(t))
+    );
 }
 
 fn reap(refresher: &mut Core, model: &mut Model, d: &Draw) {
@@ -139,7 +152,7 @@ fn reap(refresher: &mut Core, model: &mut Model, d: &Draw) {
         model.now = now;
         Ok(overdue)
     };
-    let found = refresher.reap(now);
+    let found = refresher.reap(t(now));
     assert_eq!(found, expect.as_ref().map(Vec::len).map_err(|r| *r));
     if let Ok(overdue) = expect {
         let before = model.ready.len();
@@ -176,14 +189,14 @@ fn put(refresher: &mut Core, model: &mut Model, d: &Draw) {
     } else {
         Err(Refusal::EntriesFull)
     };
-    assert_eq!(refresher.put(key, now, age, policy), expect);
+    assert_eq!(refresher.put(key, t(now), t(age), rules(policy)), expect);
 }
 
 fn sweep(rng: &mut Rng, refresher: &mut Core, model: &mut Model, d: &Draw) {
     let Draw { now, regressed, .. } = *d;
     let mut out = [u64::MAX; 2];
     let room = usize::try_from(rng.below(3)).expect("index");
-    let found = refresher.sweep(now, &mut out[..room]);
+    let found = refresher.sweep(t(now), &mut out[..room]);
     if regressed {
         assert_eq!(found, Err(Refusal::TimeRegressed));
         return;
@@ -243,6 +256,7 @@ fn drain(rng: &mut Rng, refresher: &mut Core, model: &mut Model) {
     for note in out.iter().take(written) {
         let expect = model.ready.pop_front().expect("model has it queued");
         assert_eq!((note.waiter, note.key, note.outcome), expect);
+        assert_eq!(model.told.get(&note.waiter), Some(&note.flight));
     }
 }
 

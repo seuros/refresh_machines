@@ -1,6 +1,8 @@
 #![no_std]
 #![doc = include_str!("../README.md")]
 
+use core::time::Duration;
+
 use coalesce_machines::{Coalescer, Joined, SEQUENCE_MAX, scoped};
 pub use coalesce_machines::{FlightId, Notification, Outcome, WaiterId};
 
@@ -11,8 +13,6 @@ mod refusal;
 pub use lease::Lease;
 pub use policy::{Policy, State};
 pub use refusal::Refusal;
-#[allow(deprecated)]
-pub use refusal::Refused;
 
 /// What is happening about refreshing a stale value that is being served.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,10 +25,15 @@ pub enum Revalidation {
     /// The last refresh failed and asked for quiet until this time. Just serve.
     Backoff {
         /// When the next caller will be asked to refresh again.
-        until: u64,
+        until: Duration,
     },
-    /// A refresh is due but could not be registered. Just serve; the next
-    /// caller tries again.
+    /// A refresh is due but could not be registered, for the reason given.
+    ///
+    /// This is not a refused call: the stale value is still served, so
+    /// [`Refresher::decide`] is honoured and answers
+    /// `Ok(Decision::Stale { .. })`. The failed registration changed nothing
+    /// (no lease, no flight, no waiter); only the clock advances, as for any
+    /// honoured decision. Just serve; the next caller tries again.
     Unavailable(Refusal),
 }
 
@@ -38,12 +43,12 @@ pub enum Decision {
     /// Serve the cached value.
     Fresh {
         /// Its age at `now`.
-        age: u64,
+        age: Duration,
     },
     /// Serve the cached value, stale, and mind the revalidation.
     Stale {
         /// Its age at `now`.
-        age: u64,
+        age: Duration,
         /// Who refreshes it, if anyone.
         revalidation: Revalidation,
     },
@@ -57,21 +62,33 @@ pub enum Decision {
     Wait {
         /// The caller's notification id.
         waiter: WaiterId,
+        /// The refresh being shared: what [`Refresher::flight`] answers for
+        /// the key's live lease, and the [`Notification::flight`] to come.
+        flight: FlightId,
     },
+}
+
+/// What [`Refresher::forget`] did. Both are honoured; neither is a refusal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Forgetting {
+    /// The key had metadata and it was dropped; its slot is free.
+    Forgotten,
+    /// The key had no metadata: an idempotent repeat that changed nothing.
+    NotHeld,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Entry {
     key: u64,
-    stored_at: u64,
-    age: u64,
+    stored_at: Duration,
+    age: Duration,
     policy: Policy,
     /// Failed refreshes stay quiet while `now < retry_at`; zero means none.
-    retry_at: u64,
+    retry_at: Duration,
 }
 
 impl Entry {
-    const fn age_at(&self, now: u64) -> u64 {
+    const fn age_at(&self, now: Duration) -> Duration {
         self.age.saturating_add(now.saturating_sub(self.stored_at))
     }
 }
@@ -81,7 +98,7 @@ struct Lead {
     lease: u64,
     key: u64,
     flight: FlightId,
-    deadline: u64,
+    deadline: Duration,
 }
 
 /// Bounded freshness metadata plus one refresh lease per key.
@@ -98,7 +115,7 @@ pub struct Refresher<const KEYS: usize, const FLIGHTS: usize, const WAITERS: usi
     leads: [Option<Lead>; FLIGHTS],
     flights: Coalescer<FLIGHTS, WAITERS>,
     leases: u64,
-    now: u64,
+    now: Duration,
 }
 
 impl<const KEYS: usize, const FLIGHTS: usize, const WAITERS: usize> Default
@@ -133,7 +150,7 @@ impl<const KEYS: usize, const FLIGHTS: usize, const WAITERS: usize>
             leads: [None; FLIGHTS],
             flights: Coalescer::with_scope(scope),
             leases: 0,
-            now: 0,
+            now: Duration::ZERO,
         }
     }
 
@@ -155,9 +172,14 @@ impl<const KEYS: usize, const FLIGHTS: usize, const WAITERS: usize>
     /// `lead_for`, and, only when nothing is servable,
     /// [`Refusal::FlightsFull`], [`Refusal::WaitersFull`] or
     /// [`Refusal::Exhausted`]. Nothing changes.
-    pub fn decide(&mut self, key: u64, now: u64, lead_for: u64) -> Result<Decision, Refusal> {
+    pub fn decide(
+        &mut self,
+        key: u64,
+        now: Duration,
+        lead_for: Duration,
+    ) -> Result<Decision, Refusal> {
         self.check(now)?;
-        if lead_for == 0 {
+        if lead_for.is_zero() {
             return Err(Refusal::Rejected);
         }
         let live = self
@@ -183,10 +205,11 @@ impl<const KEYS: usize, const FLIGHTS: usize, const WAITERS: usize>
                 };
                 Decision::Stale { age, revalidation }
             }
-            _ if live => Decision::Wait {
-                waiter: self.follow(key)?,
-            },
-            _ => Decision::Fetch {
+            Some(_) | None if live => {
+                let (waiter, flight) = self.follow(key)?;
+                Decision::Wait { waiter, flight }
+            }
+            Some(_) | None => Decision::Fetch {
                 lease: self.lead(key, now, lead_for)?,
             },
         };
@@ -209,8 +232,8 @@ impl<const KEYS: usize, const FLIGHTS: usize, const WAITERS: usize>
     pub fn store(
         &mut self,
         lease: Lease,
-        now: u64,
-        age: u64,
+        now: Duration,
+        age: Duration,
         policy: Policy,
     ) -> Result<(), Refusal> {
         self.check(now)?;
@@ -223,7 +246,7 @@ impl<const KEYS: usize, const FLIGHTS: usize, const WAITERS: usize>
             stored_at: now,
             age,
             policy,
-            retry_at: 0,
+            retry_at: Duration::ZERO,
         });
         self.now = now;
         Ok(())
@@ -243,9 +266,9 @@ impl<const KEYS: usize, const FLIGHTS: usize, const WAITERS: usize>
     pub fn fail(
         &mut self,
         lease: Lease,
-        now: u64,
-        retry_after: u64,
-    ) -> Result<Option<u64>, Refusal> {
+        now: Duration,
+        retry_after: Duration,
+    ) -> Result<Option<Duration>, Refusal> {
         self.check(now)?;
         let (slot, lead) = self.held(lease).ok_or(Refusal::Stale)?;
         self.flights.abandon(lead.flight)?;
@@ -286,7 +309,7 @@ impl<const KEYS: usize, const FLIGHTS: usize, const WAITERS: usize>
     /// # Errors
     ///
     /// [`Refusal::TimeRegressed`]. Nothing changes.
-    pub fn reap(&mut self, now: u64) -> Result<usize, Refusal> {
+    pub fn reap(&mut self, now: Duration) -> Result<usize, Refusal> {
         self.check(now)?;
         self.now = now;
         let mut revoked = 0;
@@ -308,7 +331,13 @@ impl<const KEYS: usize, const FLIGHTS: usize, const WAITERS: usize>
     ///
     /// [`Refusal::TimeRegressed`], or [`Refusal::EntriesFull`] when the key is
     /// new and no metadata slot is free. Nothing changes.
-    pub fn put(&mut self, key: u64, now: u64, age: u64, policy: Policy) -> Result<(), Refusal> {
+    pub fn put(
+        &mut self,
+        key: u64,
+        now: Duration,
+        age: Duration,
+        policy: Policy,
+    ) -> Result<(), Refusal> {
         self.check(now)?;
         let home = self.room_for(key).ok_or(Refusal::EntriesFull)?;
         self.entries[home] = Some(Entry {
@@ -316,7 +345,7 @@ impl<const KEYS: usize, const FLIGHTS: usize, const WAITERS: usize>
             stored_at: now,
             age,
             policy,
-            retry_at: 0,
+            retry_at: Duration::ZERO,
         });
         self.now = now;
         Ok(())
@@ -324,10 +353,17 @@ impl<const KEYS: usize, const FLIGHTS: usize, const WAITERS: usize>
 
     /// Drop the metadata for `key`, e.g. because the cache evicted its value.
     ///
-    /// Returns whether there was any. A refresh in flight is untouched.
-    pub fn forget(&mut self, key: u64) -> bool {
-        self.entry_slot(key)
-            .is_some_and(|slot| self.entries[slot].take().is_some())
+    /// Never refuses: [`Forgetting::Forgotten`] when there was metadata to
+    /// drop, [`Forgetting::NotHeld`] when the key already had none, which
+    /// changes nothing. A refresh in flight is untouched either way.
+    pub fn forget(&mut self, key: u64) -> Forgetting {
+        match self
+            .entry_slot(key)
+            .and_then(|slot| self.entries[slot].take())
+        {
+            Some(_) => Forgetting::Forgotten,
+            None => Forgetting::NotHeld,
+        }
     }
 
     /// Drop metadata that is [`State::Expired`] at `now`, writing the keys to `out`.
@@ -341,7 +377,7 @@ impl<const KEYS: usize, const FLIGHTS: usize, const WAITERS: usize>
     /// # Errors
     ///
     /// [`Refusal::TimeRegressed`]. Nothing changes.
-    pub fn sweep(&mut self, now: u64, out: &mut [u64]) -> Result<usize, Refusal> {
+    pub fn sweep(&mut self, now: Duration, out: &mut [u64]) -> Result<usize, Refusal> {
         self.check(now)?;
         self.now = now;
         let mut written = 0;
@@ -389,20 +425,20 @@ impl<const KEYS: usize, const FLIGHTS: usize, const WAITERS: usize>
 
     /// Age of the value held for `key` at `now`, if there is metadata for it.
     #[must_use]
-    pub fn age(&self, key: u64, now: u64) -> Option<u64> {
+    pub fn age(&self, key: u64, now: Duration) -> Option<Duration> {
         Some(self.entries[self.entry_slot(key)?]?.age_at(now))
     }
 
     /// Fresh, stale or expired at `now`; `None` when the key has no metadata.
     #[must_use]
-    pub fn state(&self, key: u64, now: u64) -> Option<State> {
+    pub fn state(&self, key: u64, now: Duration) -> Option<State> {
         let entry = self.entries[self.entry_slot(key)?]?;
         Some(entry.policy.state(entry.age_at(now)))
     }
 
     /// Age of the held value if a refresh error at `now` may be answered with it.
     #[must_use]
-    pub fn stale_if_error(&self, key: u64, now: u64) -> Option<u64> {
+    pub fn stale_if_error(&self, key: u64, now: Duration) -> Option<Duration> {
         let entry = self.entries[self.entry_slot(key)?]?;
         let age = entry.age_at(now);
         entry.policy.if_error(age).then_some(age)
@@ -432,7 +468,7 @@ impl<const KEYS: usize, const FLIGHTS: usize, const WAITERS: usize>
 
     /// The latest time this refresher accepted.
     #[must_use]
-    pub const fn now(&self) -> u64 {
+    pub const fn now(&self) -> Duration {
         self.now
     }
 
@@ -484,8 +520,8 @@ impl<const KEYS: usize, const FLIGHTS: usize, const WAITERS: usize>
         WAITERS
     }
 
-    const fn check(&self, now: u64) -> Result<(), Refusal> {
-        if now < self.now {
+    const fn check(&self, now: Duration) -> Result<(), Refusal> {
+        if now.as_nanos() < self.now.as_nanos() {
             Err(Refusal::TimeRegressed)
         } else {
             Ok(())
@@ -518,7 +554,7 @@ impl<const KEYS: usize, const FLIGHTS: usize, const WAITERS: usize>
     }
 
     /// Issue a lease for `key`: a new refresh, or a takeover of an overdue one.
-    fn lead(&mut self, key: u64, now: u64, lead_for: u64) -> Result<Lease, Refusal> {
+    fn lead(&mut self, key: u64, now: Duration, lead_for: Duration) -> Result<Lease, Refusal> {
         let sequence = self.leases.saturating_add(1);
         if sequence > SEQUENCE_MAX {
             return Err(Refusal::Exhausted);
@@ -556,9 +592,9 @@ impl<const KEYS: usize, const FLIGHTS: usize, const WAITERS: usize>
         Ok(Lease(lease))
     }
 
-    fn follow(&mut self, key: u64) -> Result<WaiterId, Refusal> {
+    fn follow(&mut self, key: u64) -> Result<(WaiterId, FlightId), Refusal> {
         match self.flights.join(key)? {
-            Joined::Follower { waiter, .. } => Ok(waiter),
+            Joined::Follower { waiter, flight } => Ok((waiter, flight)),
             // Unreachable while every lead has a flight; undo and refuse.
             Joined::Leader(flight) => {
                 self.flights.abandon(flight)?;

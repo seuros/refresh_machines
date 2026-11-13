@@ -1,7 +1,7 @@
 //! Leases and the coalesce flights they ride on.
 use coalesce_machines::scoped;
 
-use super::{RULES, Small, fetch, revalidation, wait};
+use super::{RULES, Small, fetch, revalidation, t, wait};
 use crate::*;
 
 #[test]
@@ -18,7 +18,7 @@ fn a_live_lease_names_the_flight_its_waiters_are_woken_with() {
     assert_eq!(refresher.flight(lease), Some(flight));
     assert_eq!(refresher, before);
 
-    assert_eq!(refresher.store(lease, 2, 0, RULES), Ok(()));
+    assert_eq!(refresher.store(lease, t(2), t(0), RULES), Ok(()));
     let mut out = [Notification::default(); 2];
     assert_eq!(refresher.drain(&mut out), 1);
     assert_eq!(
@@ -37,22 +37,70 @@ fn a_live_lease_names_the_flight_its_waiters_are_woken_with() {
 }
 
 #[test]
+fn a_wait_names_the_flight_of_the_live_lease_it_shares() {
+    let mut refresher = Small::with_scope(3);
+    let Ok(Decision::Fetch { lease: dead }) = refresher.decide(5, t(0), t(10)) else {
+        panic!("leads");
+    };
+    let other = fetch(&mut refresher, 6, 0);
+    let flight = refresher.flight(dead).expect("live");
+    let Ok(Decision::Wait {
+        waiter: first,
+        flight: shared,
+    }) = refresher.decide(5, t(1), t(10))
+    else {
+        panic!("waits");
+    };
+    assert_eq!(shared, flight);
+    assert_eq!(shared.scope(), 3);
+    // Another key waits on another flight.
+    let Ok(Decision::Wait { flight: apart, .. }) = refresher.decide(6, t(1), t(10)) else {
+        panic!("waits");
+    };
+    assert_eq!(Some(apart), refresher.flight(other));
+    assert_ne!(apart, shared);
+
+    // After a takeover the flight is the same one, now under the new lease.
+    let Ok(Decision::Fetch { lease: heir }) = refresher.decide(5, t(10), t(10)) else {
+        panic!("takes over");
+    };
+    let Ok(Decision::Wait {
+        waiter: second,
+        flight: again,
+    }) = refresher.decide(5, t(11), t(10))
+    else {
+        panic!("waits");
+    };
+    assert_ne!(second, first);
+    assert_eq!(again, shared);
+    assert_eq!(refresher.flight(heir), Some(again));
+    assert_eq!(refresher.flight(dead), None);
+
+    // Both are woken with the flight they were told.
+    assert_eq!(refresher.store(heir, t(12), t(0), RULES), Ok(()));
+    for waiter in [first, second] {
+        let note = refresher.poll().expect("woken");
+        assert_eq!((note.waiter, note.flight), (waiter, shared));
+    }
+}
+
+#[test]
 fn a_takeover_issues_a_new_lease_for_the_same_flight() {
     let mut refresher = Small::new();
-    let Ok(Decision::Fetch { lease: dead }) = refresher.decide(5, 0, 10) else {
+    let Ok(Decision::Fetch { lease: dead }) = refresher.decide(5, t(0), t(10)) else {
         panic!("leads");
     };
     let flight = refresher.flight(dead).expect("live");
     let waiter = wait(&mut refresher, 5, 9);
     // Overdue but not replaced: still the lease that reports, still mapped.
     assert_eq!(refresher.flight(dead), Some(flight));
-    let Ok(Decision::Fetch { lease: heir }) = refresher.decide(5, 10, 10) else {
+    let Ok(Decision::Fetch { lease: heir }) = refresher.decide(5, t(10), t(10)) else {
         panic!("takes over");
     };
     assert_ne!(heir, dead);
     assert_eq!(refresher.flight(dead), None);
     assert_eq!(refresher.flight(heir), Some(flight));
-    assert_eq!(refresher.fail(heir, 11, 0), Ok(None));
+    assert_eq!(refresher.fail(heir, t(11), t(0)), Ok(None));
     let note = refresher.poll().expect("waiter kept across the takeover");
     assert_eq!(
         (note.waiter, note.flight, note.outcome),
@@ -69,21 +117,21 @@ fn every_way_a_lease_ends_also_ends_its_mapping() {
     assert_eq!(refresher.abandon(abandoned), Ok(()));
     assert_eq!(refresher.flight(abandoned), None);
 
-    let Ok(Decision::Fetch { lease: reaped }) = refresher.decide(1, 0, 5) else {
+    let Ok(Decision::Fetch { lease: reaped }) = refresher.decide(1, t(0), t(5)) else {
         panic!("leads");
     };
     let first = refresher.flight(reaped).expect("live");
-    assert_eq!(refresher.reap(5), Ok(1));
+    assert_eq!(refresher.reap(t(5)), Ok(1));
     assert_eq!(refresher.flight(reaped), None);
 
     // A later refresh of the same key rides a new flight.
     let again = fetch(&mut refresher, 1, 6);
     let second = refresher.flight(again).expect("live");
     assert_ne!(second, first);
-    assert_eq!(refresher.store(again, 7, 0, RULES), Ok(()));
+    assert_eq!(refresher.store(again, t(7), t(0), RULES), Ok(()));
 
     // A background revalidation has a flight like any other lease.
-    let (_, lead) = revalidation(refresher.decide(1, 18, 100));
+    let (_, lead) = revalidation(refresher.decide(1, t(18), t(100)));
     let Revalidation::Lead(lease) = lead else {
         panic!("leads, got {lead:?}");
     };
@@ -116,10 +164,7 @@ fn leases_that_were_never_issued_or_belong_elsewhere_name_no_flight() {
 }
 
 #[test]
-#[allow(deprecated)]
-fn the_old_refusal_name_still_resolves_and_coalesce_refusals_convert() {
-    let old: Refused = Refusal::Stale;
-    assert_eq!(old, Refusal::Stale);
+fn coalesce_refusals_convert() {
     for (from, to) in [
         (
             coalesce_machines::Refusal::FlightsFull,

@@ -1,7 +1,12 @@
 module RefreshMachines
   VERSION: String
 
+  # Every instant (`now`, `Backoff#until`) and span (ages, policy windows,
+  # `lead_for`, `retry_after`) is Integer nanoseconds. Arguments must be in
+  # 0..2**64-1; a returned sum may be larger, it never wraps.
   type state = :fresh | :stale | :expired
+  # Refusals: the call was not honoured and changed nothing. Every reason has
+  # its own symbol; there is no catch-all.
   type refusal = :time_regressed | :rejected | :entries_full | :flights_full
                | :waiters_full | :exhausted | :stale
 
@@ -22,40 +27,60 @@ module RefreshMachines
                 | (age: Integer) -> Fresh
   end
 
-  class Stale < Data
-    type revalidation = :lead | :in_flight | :backoff | :flights_full | :exhausted
+  # Who refreshes a stale value that is being served.
+  type revalidation = Lead | :in_flight | Backoff | Unavailable
 
+  class Stale < Data
     attr_reader age: Integer
     attr_reader revalidation: revalidation
-    attr_reader lease_id: Integer?
-    attr_reader retry_at: Integer?
-    def self.new: (Integer age, revalidation revalidation, Integer? lease_id, Integer? retry_at) -> Stale
-                | (age: Integer, revalidation: revalidation, lease_id: Integer?, retry_at: Integer?) -> Stale
+    def self.new: (Integer age, revalidation revalidation) -> Stale
+                | (age: Integer, revalidation: revalidation) -> Stale
   end
 
+  # Ids are Integers: lease ids, waiter ids and flight ids.
   class Fetch < Data
-    attr_reader lease_id: Integer
-    attr_reader key: Integer
-    def self.new: (Integer lease_id, Integer key) -> Fetch
-                | (lease_id: Integer, key: Integer) -> Fetch
+    attr_reader lease: Integer
+    def self.new: (Integer lease) -> Fetch
+                | (lease: Integer) -> Fetch
   end
 
   class Wait < Data
-    attr_reader waiter_id: Integer
-    attr_reader key: Integer
-    def self.new: (Integer waiter_id, Integer key) -> Wait
-                | (waiter_id: Integer, key: Integer) -> Wait
+    attr_reader waiter: Integer
+    attr_reader flight: Integer
+    def self.new: (Integer waiter, Integer flight) -> Wait
+                | (waiter: Integer, flight: Integer) -> Wait
+  end
+
+  class Lead < Data
+    attr_reader lease: Integer
+    def self.new: (Integer lease) -> Lead
+                | (lease: Integer) -> Lead
+  end
+
+  class Backoff < Data
+    attr_reader until: Integer
+    def self.new: (Integer until_) -> Backoff
+                | (until: Integer) -> Backoff
+  end
+
+  class Unavailable < Data
+    # Why the refresh was not registered.
+    type reason = :flights_full | :exhausted
+
+    attr_reader refusal: reason
+    def self.new: (reason refusal) -> Unavailable
+                | (refusal: reason) -> Unavailable
   end
 
   class Notification < Data
     type outcome = :completed | :abandoned
 
-    attr_reader waiter_id: Integer
-    attr_reader flight_id: Integer
+    attr_reader waiter: Integer
+    attr_reader flight: Integer
     attr_reader key: Integer
     attr_reader outcome: outcome
-    def self.new: (Integer waiter_id, Integer flight_id, Integer key, outcome outcome) -> Notification
-                | (waiter_id: Integer, flight_id: Integer, key: Integer, outcome: outcome) -> Notification
+    def self.new: (Integer waiter, Integer flight, Integer key, outcome outcome) -> Notification
+                | (waiter: Integer, flight: Integer, key: Integer, outcome: outcome) -> Notification
   end
 
   class Refresher
@@ -63,25 +88,46 @@ module RefreshMachines
     FLIGHT_CAPACITY: Integer
     WAITER_CAPACITY: Integer
 
-    def self.new: (?scope: Integer) -> Refresher
+    # Scope zero.
+    def self.new: () -> Refresher
+    # `scope` is an Integer in 0..65_535, carried in the top 16 bits of every id.
+    def self.with_scope: (Integer scope) -> Refresher
     def scope: () -> Integer
-    def decide: (Integer key, Integer now, Integer lead_for) -> (Fresh | Stale | Fetch | Wait | refusal)
-    def store: (Integer lease_id, Integer now, Integer age, Policy policy) -> (:stored | refusal)
-    def fail: (Integer lease_id, Integer now, Integer retry_after) -> (Integer | nil | refusal)
-    def abandon: (Integer lease_id) -> (:abandoned | :stale)
+    # Honoured: Fresh, Stale, Fetch, Wait. Refused: :time_regressed, :rejected,
+    # and, only when nothing is servable, :flights_full, :waiters_full, :exhausted.
+    def decide: (Integer key, Integer now, Integer lead_for) -> (Fresh | Stale | Fetch | Wait | :time_regressed | :rejected | :flights_full | :waiters_full | :exhausted)
+    # Honoured: :stored. Refused: :time_regressed, :stale, :entries_full.
+    def store: (Integer lease, Integer now, Integer age, Policy policy) -> (:stored | :time_regressed | :stale | :entries_full)
+    # Honoured: the age of the value that covers for the failure, or nil when
+    # nothing does. Refused: :time_regressed, :stale.
+    def fail: (Integer lease, Integer now, Integer retry_after) -> (Integer | nil | :time_regressed | :stale)
+    # Honoured: :abandoned. Refused: :stale.
+    def abandon: (Integer lease) -> (:abandoned | :stale)
+    # Honoured: leases revoked. Refused: :time_regressed.
     def reap: (Integer now) -> (Integer | :time_regressed)
-    def put: (Integer key, Integer now, Integer age, Policy policy) -> (:stored | refusal)
-    def forget: (Integer key) -> bool
+    # Honoured: :stored. Refused: :time_regressed, :entries_full.
+    def put: (Integer key, Integer now, Integer age, Policy policy) -> (:stored | :time_regressed | :entries_full)
+    # Honoured: :forgotten when there was metadata to drop, and the repeat
+    # :not_held when the key had none (nothing changes). Never refuses.
+    def forget: (Integer key) -> (:forgotten | :not_held)
+    # Honoured: the swept keys. Refused: :time_regressed.
     def sweep: (Integer now, Integer max) -> (Array[Integer] | :time_regressed)
-    def cancel: (Integer waiter_id) -> (:cancelled | :stale)
+    # Honoured: :cancelled. Refused: :stale.
+    def cancel: (Integer waiter) -> (:cancelled | :stale)
+    # The oldest queued notification, or nil when nothing is queued. Never refuses.
+    def poll: () -> Notification?
+    # At most `max` queued notifications, oldest first. Never refuses.
     def drain: (Integer max) -> Array[Notification]
     def age: (Integer key, Integer now) -> Integer?
     def state: (Integer key, Integer now) -> state?
     def stale_if_error: (Integer key, Integer now) -> Integer?
     def leading: (Integer key) -> Integer?
-    def flight: (Integer lease_id) -> Integer?
+    def flight: (Integer lease) -> Integer?
     def now: () -> Integer
+    # Keys with metadata (the core's `len`).
     def size: () -> Integer
+    # Whether no key has metadata (the core's `is_empty`).
+    def empty?: () -> bool
     def in_flight: () -> Integer
     def waiting: () -> Integer
     def pending: () -> Integer

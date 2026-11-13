@@ -1,7 +1,7 @@
 //! Scoped ids: what one refresher issued names nothing in another.
 use coalesce_machines::{Coalescer, Joined, scoped};
 
-use super::{RULES, Small, fetch, wait};
+use super::{RULES, Small, fetch, t, wait};
 use crate::*;
 
 #[test]
@@ -21,12 +21,15 @@ fn scopes_keep_the_leases_and_waiters_of_separate_refreshers_apart() {
 
     // A foreign lease or waiter is stale here, and the refusal changes nothing.
     let before = near.clone();
-    assert_eq!(near.store(far_lease, 2, 0, RULES), Err(Refusal::Stale));
-    assert_eq!(near.fail(far_lease, 2, 5), Err(Refusal::Stale));
+    assert_eq!(
+        near.store(far_lease, t(2), t(0), RULES),
+        Err(Refusal::Stale)
+    );
+    assert_eq!(near.fail(far_lease, t(2), t(5)), Err(Refusal::Stale));
     assert_eq!(near.abandon(far_lease), Err(Refusal::Stale));
     assert_eq!(near.cancel(far_waiter), Err(Refusal::Stale));
     assert_eq!(near, before);
-    assert_eq!(near.store(near_lease, 2, 0, RULES), Ok(()));
+    assert_eq!(near.store(near_lease, t(2), t(0), RULES), Ok(()));
     assert_eq!(near.poll().map(|note| note.waiter), Some(near_waiter));
     assert_eq!(far.cancel(far_waiter), Ok(()));
 }
@@ -61,6 +64,6 @@ fn the_last_lease_sequence_is_issued_then_the_scope_is_spent() {
     refresher.leases = coalesce_machines::SEQUENCE_MAX - 1;
     assert_eq!(fetch(&mut refresher, 1, 0).raw(), u64::MAX);
     let before = refresher.clone();
-    assert_eq!(refresher.decide(2, 0, 100), Err(Refusal::Exhausted));
+    assert_eq!(refresher.decide(2, t(0), t(100)), Err(Refusal::Exhausted));
     assert_eq!(refresher, before);
 }

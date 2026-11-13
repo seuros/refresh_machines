@@ -2,7 +2,6 @@ use core::fmt;
 
 /// Why a call changed nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum Refusal {
     /// `now` is earlier than a time this refresher already accepted.
     TimeRegressed,
@@ -36,17 +35,13 @@ impl fmt::Display for Refusal {
 
 impl core::error::Error for Refusal {}
 
-/// The former name of [`Refusal`].
-#[deprecated(note = "renamed to `Refusal`")]
-pub type Refused = Refusal;
-
 impl From<coalesce_machines::Refusal> for Refusal {
     fn from(refusal: coalesce_machines::Refusal) -> Self {
         match refusal {
             coalesce_machines::Refusal::FlightsFull => Self::FlightsFull,
             coalesce_machines::Refusal::WaitersFull => Self::WaitersFull,
             coalesce_machines::Refusal::Exhausted => Self::Exhausted,
-            _ => Self::Stale,
+            coalesce_machines::Refusal::Stale => Self::Stale,
         }
     }
 }
