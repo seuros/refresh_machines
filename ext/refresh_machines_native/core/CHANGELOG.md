@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.6.0](https://github.com/seuros/refresh_machines/compare/refresh-machines-v0.5.0...refresh-machines-v0.6.0) (2026-11-13)
+
+
+### ⚠ BREAKING CHANGES
+
+* leases, waiter ids and flight ids of a refresher share one sequence, so a handle rebuilt as the wrong kind names nothing. Requires coalesce-machines >= 0.6. Raw lease numbers change; capacity is checked before the sequence.
+
+### Features
+
+* scope ids through periscope-machines and draw leases from the coalescer's sequence; add resumed and issued ([9a9537b](https://github.com/seuros/refresh_machines/commit/9a9537beef8a10e1be244167f4713698dfaa3f1a))
+
 ## [0.5.0](https://github.com/seuros/refresh_machines/compare/refresh-machines-v0.4.0...refresh-machines-v0.5.0) (2026-11-13)
 
 
