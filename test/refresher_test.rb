@@ -101,6 +101,39 @@ class RefresherTest < Minitest::Test
     assert_equal [R::Notification.new(waiter.waiter_id, 5, :abandoned)], @refresher.drain(10)
   end
 
+  def test_scopes_keep_the_ids_of_separate_refreshers_apart
+    near = R::Refresher.new(scope: 1)
+    far = R::Refresher.new(scope: 2)
+    assert_equal [0, 1, 2], [@refresher.scope, near.scope, far.scope]
+    near_fetch = near.decide(7, 0, 100)
+    far_fetch = far.decide(7, 0, 100)
+    near_wait = near.decide(7, 1, 100)
+    far_wait = far.decide(7, 1, 100)
+    assert_equal (1 << 48) | 1, near_fetch.lease_id
+    assert_equal (2 << 48) | 2, far_wait.waiter_id
+    assert_equal 1, @refresher.decide(7, 0, 100).lease_id # scope zero keeps plain counters
+
+    # A foreign lease or waiter is stale here, and the refusal changes nothing.
+    assert_equal :stale, near.store(far_fetch.lease_id, 2, 0, RULES)
+    assert_equal :stale, near.fail(far_fetch.lease_id, 2, 5)
+    assert_equal :stale, near.abandon(far_fetch.lease_id)
+    assert_equal :stale, near.cancel(far_wait.waiter_id)
+    assert_equal [near_fetch.lease_id, 1, 1, 0], [near.leading(7), near.in_flight, near.waiting, near.pending]
+    assert_equal :stored, near.store(near_fetch.lease_id, 2, 0, RULES)
+    assert_equal [near_wait.waiter_id], near.drain(4).map(&:waiter_id)
+    assert_equal :cancelled, far.cancel(far_wait.waiter_id)
+  end
+
+  def test_scope_must_be_a_sixteen_bit_integer
+    assert_equal 65_535, R::Refresher.new(scope: 65_535).scope
+    assert_raises(RangeError) { R::Refresher.new(scope: 65_536) }
+    assert_raises(RangeError) { R::Refresher.new(scope: -1) }
+    assert_raises(TypeError) { R::Refresher.new(scope: 1.0) }
+    assert_raises(TypeError) { R::Refresher.new(scope: nil) }
+    assert_raises(ArgumentError) { R::Refresher.new(1) }
+    assert_raises(ArgumentError) { R::Refresher.new(scopes: 1) }
+  end
+
   def test_waiters_cancel
     fetch = @refresher.decide(1, 0, 100)
     waiter = @refresher.decide(1, 0, 100)

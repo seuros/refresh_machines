@@ -3,34 +3,14 @@
 
 use core::fmt;
 
-use coalesce_machines::{Coalescer, Joined};
+use coalesce_machines::{Coalescer, Joined, SEQUENCE_MAX, scoped};
 pub use coalesce_machines::{FlightId, Notification, Outcome, WaiterId};
 
+mod lease;
 mod policy;
 
+pub use lease::Lease;
 pub use policy::{Policy, State};
-
-/// The right to refresh one key, and the token that reports how it went.
-///
-/// Issued by [`Refresher::decide`]. Never reissued: once the refresh is
-/// reported, abandoned, reaped or taken over, the lease is
-/// [`Refused::Stale`] forever.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Lease(u64);
-
-impl Lease {
-    /// Rebuild a lease from [`Self::raw`], e.g. after it crossed an FFI or queue boundary.
-    #[must_use]
-    pub const fn from_raw(raw: u64) -> Self {
-        Self(raw)
-    }
-
-    /// The lease as a plain integer. Never zero for an issued lease.
-    #[must_use]
-    pub const fn raw(self) -> u64 {
-        self.0
-    }
-}
 
 /// Why a call changed nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -177,16 +157,35 @@ impl<const KEYS: usize, const FLIGHTS: usize, const WAITERS: usize> Default
 impl<const KEYS: usize, const FLIGHTS: usize, const WAITERS: usize>
     Refresher<KEYS, FLIGHTS, WAITERS>
 {
-    /// Start with no metadata, nothing in flight, at time zero.
+    /// Start with no metadata, nothing in flight, at time zero, in scope zero.
     #[must_use]
     pub const fn new() -> Self {
+        Self::with_scope(0)
+    }
+
+    /// Start empty at time zero, issuing leases and waiter ids that carry `scope`.
+    ///
+    /// Leases and waiter ids are plain integers, so two refreshers in the same
+    /// scope issue the same ones, and an id handed to the wrong refresher can
+    /// name a live lease or waiter there. Give each refresher, and each
+    /// coalescer whose ids could meet it, its own scope: an id from another
+    /// scope is then always [`Refused::Stale`]. Keeping scopes distinct is
+    /// the caller's job.
+    #[must_use]
+    pub const fn with_scope(scope: u16) -> Self {
         Self {
             entries: [None; KEYS],
             leads: [None; FLIGHTS],
-            flights: Coalescer::new(),
+            flights: Coalescer::with_scope(scope),
             leases: 0,
             now: 0,
         }
+    }
+
+    /// The scope carried by every lease and waiter id this refresher issues.
+    #[must_use]
+    pub const fn scope(&self) -> u16 {
+        self.flights.scope()
     }
 
     /// Decide what a caller asking for `key` at `now` should do.
@@ -544,7 +543,11 @@ impl<const KEYS: usize, const FLIGHTS: usize, const WAITERS: usize>
 
     /// Issue a lease for `key`: a new refresh, or a takeover of an overdue one.
     fn lead(&mut self, key: u64, now: u64, lead_for: u64) -> Result<Lease, Refused> {
-        let lease = self.leases.checked_add(1).ok_or(Refused::Exhausted)?;
+        let sequence = self.leases.saturating_add(1);
+        if sequence > SEQUENCE_MAX {
+            return Err(Refused::Exhausted);
+        }
+        let lease = scoped(self.scope(), sequence);
         let deadline = now.saturating_add(lead_for);
         if let Some(lead) = self
             .lead_slot(key)
@@ -573,7 +576,7 @@ impl<const KEYS: usize, const FLIGHTS: usize, const WAITERS: usize>
                 deadline,
             });
         }
-        self.leases = lease;
+        self.leases = sequence;
         Ok(Lease(lease))
     }
 

@@ -4,7 +4,10 @@ mod init;
 use std::cell::RefCell;
 
 use magnus::{
-    Error, Integer, RArray, RClass, Ruby, Symbol, TryConvert, Value, prelude::*, typed_data::Obj,
+    Error, Integer, RArray, RClass, Ruby, Symbol, TryConvert, Value,
+    prelude::*,
+    scan_args::{get_kwargs, scan_args},
+    typed_data::Obj,
 };
 use refresh_machines::{
     Decision, Lease, Notification, Outcome, Policy, Refresher as Core, Refused, Revalidation,
@@ -28,6 +31,23 @@ impl TryConvert for Number {
         }
         u64::try_convert(value).map(Self)
     }
+}
+
+/// The optional `scope:` keyword of a constructor; zero when omitted.
+fn scope_keyword(ruby: &Ruby, args: &[Value]) -> Result<u16, Error> {
+    let args = scan_args::<(), (), (), (), _, ()>(args)?;
+    let keywords = get_kwargs::<_, (), (Option<Value>,), ()>(args.keywords, &[], &["scope"])?;
+    let Some(value) = keywords.optional.0 else {
+        return Ok(0);
+    };
+    if Integer::from_value(value).is_none() {
+        return Err(Error::new(
+            ruby.exception_type_error(),
+            "scope must be an Integer",
+        ));
+    }
+    u16::try_convert(value)
+        .map_err(|_| Error::new(ruby.exception_range_error(), "scope must be in 0..=65535"))
 }
 
 /// A `RefreshMachines::Policy`, read field by field so every one is validated.
@@ -109,10 +129,14 @@ struct Refresher {
 }
 
 impl Refresher {
-    const fn new() -> Self {
-        Self {
-            core: RefCell::new(Core::new()),
-        }
+    fn new(ruby: &Ruby, args: &[Value]) -> Result<Self, Error> {
+        Ok(Self {
+            core: RefCell::new(Core::with_scope(scope_keyword(ruby, args)?)),
+        })
+    }
+
+    fn scope(&self) -> u16 {
+        self.core.borrow().scope()
     }
 
     fn decide(

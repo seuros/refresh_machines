@@ -5,6 +5,7 @@ use super::*;
 
 mod model;
 mod random;
+mod scope;
 
 const MAX: u64 = u64::MAX;
 const RULES: Policy = Policy::new(10, 5, 20);

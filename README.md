@@ -256,6 +256,7 @@ refresher.decide(1, 10, 0)       # => :rejected, a zero lease is overdue at birt
 - **Everything is an Integer** in `0..2**64-1`. Floats, nil and strings raise `TypeError`. Out of range raises `RangeError`. A policy argument that isn't a `Policy` raises `TypeError`.
 - **Refusals don't raise.** `:time_regressed`, `:rejected`, `:entries_full`, `:flights_full`, `:waiters_full`, `:exhausted` and `:stale` are answers, and a refused call changes nothing.
 - **A lease is a capability.** Whoever holds the `lease_id` reports the refresh. Reported, abandoned, reaped or taken over, it answers `:stale` forever.
+- **Scopes keep refreshers apart.** Lease and waiter ids are plain Integers counted from 1, so two refreshers issue the same ones, and an id handed to the wrong refresher can name a live lease or waiter there. If you run more than one, or a `CoalesceMachines::Coalescer` beside it, give each its own scope: `Refresher.new(scope: 3)`, any Integer in `0..65_535`. An id from another scope is always `:stale`. A `scope:` that isn't an Integer raises `TypeError`; out of range raises `RangeError`.
 - **Waiters ask again.** A notification says the refresh settled, `:completed` or `:abandoned`. It doesn't carry a decision. Call `decide` again.
 - **Frozen means frozen.** `freeze` the refresher and every mutating call raises `FrozenError`.
 

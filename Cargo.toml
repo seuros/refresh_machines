@@ -11,7 +11,7 @@ license = "MIT"
 [workspace.dependencies]
 refresh-machines = { path = "ext/refresh_machines_native/core" }
 magnus = { version = "0.9.3", default-features = false }
-coalesce-machines = ">=0.2"
+coalesce-machines = ">=0.3"
 rb-sys = { version = "0.9.130", default-features = false, features = ["stable-api-compiled-fallback"] }
 
 [workspace.lints.rust]

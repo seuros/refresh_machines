@@ -71,6 +71,12 @@ assert_eq!(
   gets one `Notification` (`Completed` after `store`, `Abandoned` after `fail`,
   `abandon` or `reap`) through `poll` or `drain`, then decides again. A takeover
   keeps the waiters. `cancel` withdraws one.
+- **Scopes.** Leases and waiter ids are plain integers, so two refreshers in
+  the same scope issue the same ones. `Refresher::with_scope(scope)` puts a
+  caller-chosen `u16` in the top 16 bits of every lease and waiter id, using the
+  `coalesce-machines` layout; an id from another refresher or coalescer in a
+  different scope is always `Refused::Stale`. `new()` is scope zero. After
+  2^48 - 1 leases `decide` answers `Refused::Exhausted`.
 - **Capacities.** `Refresher<KEYS, FLIGHTS, WAITERS>`. A full table answers
   `EntriesFull`, `FlightsFull` or `WaitersFull`; nothing is evicted. While a
   stale value is servable a full flight table does not refuse the caller: it

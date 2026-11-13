@@ -18,7 +18,8 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     class.const_set("CAPACITY", KEY_CAPACITY)?;
     class.const_set("FLIGHT_CAPACITY", FLIGHT_CAPACITY)?;
     class.const_set("WAITER_CAPACITY", WAITER_CAPACITY)?;
-    class.define_singleton_method("new", function!(Refresher::new, 0))?;
+    class.define_singleton_method("new", function!(Refresher::new, -1))?;
+    class.define_method("scope", method!(Refresher::scope, 0))?;
     class.define_method("decide", method!(Refresher::decide, 3))?;
     class.define_method("store", method!(Refresher::store, 4))?;
     class.define_method("fail", method!(Refresher::fail, 3))?;

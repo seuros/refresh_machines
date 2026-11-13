@@ -62,7 +62,8 @@ module RefreshMachines
     FLIGHT_CAPACITY: Integer
     WAITER_CAPACITY: Integer
 
-    def self.new: () -> Refresher
+    def self.new: (?scope: Integer) -> Refresher
+    def scope: () -> Integer
     def decide: (Integer key, Integer now, Integer lead_for) -> (Fresh | Stale | Fetch | Wait | refusal)
     def store: (Integer lease_id, Integer now, Integer age, Policy policy) -> (:stored | refusal)
     def fail: (Integer lease_id, Integer now, Integer retry_after) -> (Integer | nil | refusal)
