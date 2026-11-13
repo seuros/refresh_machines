@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.2.0](https://github.com/seuros/refresh_machines/compare/refresh_machines/v0.1.2...refresh_machines/v0.2.0) (2026-11-13)
+
+
+### ⚠ BREAKING CHANGES
+
+* Refresher::drain takes &mut [Notification] and sweep takes &mut [u64] instead of Option slices; RefreshMachines::Notification gains flight_id as its second field. Refused is kept as a deprecated alias of Refusal. Requires coalesce-machines >= 0.4.
+
+### Features
+
+* map leases to flights, carry flight_id in notifications, plain output buffers ([0564a61](https://github.com/seuros/refresh_machines/commit/0564a61d8588cbe390248eab537e67bce7b1a45e))
+
 ## [0.1.2](https://github.com/seuros/refresh_machines/compare/refresh_machines/v0.1.1...refresh_machines/v0.1.2) (2026-11-13)
 
 
