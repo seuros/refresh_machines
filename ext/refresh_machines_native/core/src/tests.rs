@@ -9,6 +9,7 @@ mod model;
 mod policy;
 mod random;
 mod scope;
+mod sequence;
 mod sweep;
 
 const MAX: Duration = Duration::MAX;
@@ -48,6 +49,16 @@ fn wait<const K: usize, const F: usize, const W: usize>(
         }
         other => panic!("expected to wait, got {other:?}"),
     }
+}
+
+/// A refresher in `scope` with `left` ids still to give: the way to the end
+/// of the sequence is the public `resumed`, the one a restart uses.
+fn near_the_end<const K: usize, const F: usize, const W: usize>(
+    scope: u16,
+    left: u64,
+) -> Refresher<K, F, W> {
+    Refresher::resumed(scope, periscope_machines::SEQUENCE_MAX - left)
+        .expect("short of the end is within the sequence")
 }
 
 fn revalidation(decision: Result<Decision, Refusal>) -> (Duration, Revalidation) {

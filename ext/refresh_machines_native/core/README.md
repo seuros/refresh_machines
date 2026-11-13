@@ -90,19 +90,43 @@ assert_eq!(
   caused it. A takeover issues a new lease for the same flight: the new lease
   answers the old one's flight and the old one answers `None`, as does any
   stale lease or one from another scope. The mapping ends when the refresh
-  settles, so record it while the lease is live. Leases and flights are counted
-  separately; do not compare their raw values.
+  settles, so record it while the lease is live.
+- **One sequence.** Leases, waiter ids and flight ids all come from the one
+  sequence of the coalescer inside (leases through its `reserve`), so no two
+  ids of a refresher are equal, whatever their kind. A lease rebuilt as a
+  `WaiterId`, or a waiter or flight id rebuilt as a `Lease`, is
+  `Refusal::Stale` and changes nothing. A new refresh takes two ids, its
+  lease and then its flight; a takeover takes one, the new lease; a wait takes
+  one.
 - **Output buffers.** `drain(out: &mut [Notification])` and
   `sweep(now, out: &mut [u64])` write the first `n` entries, return `n` and
   leave the rest untouched. `[Notification::default(); N]` and `[0; N]` size
   them; the default notification is a placeholder that is never emitted (its
   ids are raw zero, never issued). Read only the `n` entries reported.
-- **Scopes.** Leases and waiter ids are plain integers, so two refreshers in
-  the same scope issue the same ones. `Refresher::with_scope(scope)` puts a
-  caller-chosen `u16` in the top 16 bits of every lease and waiter id, using the
-  `coalesce-machines` layout; an id from another refresher or coalescer in a
-  different scope is always `Refusal::Stale`. `new()` is scope zero. After
-  2^48 - 1 leases `decide` answers `Refusal::Exhausted`.
+- **Scopes.** Ids are only meaningful to the refresher that issued them. Two
+  refreshers in the same scope issue the same leases and waiter ids, and an id
+  handed to the wrong one can name a live lease or waiter there, so give each
+  refresher, and any bare coalescer beside it, its own scope:
+  `Refresher::with_scope(scope)` puts a caller-chosen `u16` in the top 16 bits
+  of every lease, waiter id and flight id. An id from another scope is always
+  `Refusal::Stale` (`None` from `flight`), refused before any table is read.
+  `new()` is scope zero and counts 1, 2, 3 across all three kinds. The
+  refresher cannot choose a scope itself. The layout belongs to
+  `periscope-machines`, so use its `scoped`, `scope_of` and `sequence_of` on
+  raw ids. After `periscope_machines::SEQUENCE_MAX` (2^48 - 1) ids `decide`
+  answers `Refusal::Exhausted` wherever it would need one, and already when a
+  new refresh would need two and one is left. A full table is reported before
+  a spent sequence (`FlightsFull` or `WaitersFull`, then `Exhausted`), and a
+  refused `decide` consumes no id.
+- **Restarts.** A new refresher counts from one again, so a lease or waiter id
+  that outlived a restart could name a new refresh. Either save `issued()` and
+  build the replacement with `Refresher::resumed(scope, issued)` (empty, at
+  time zero, the sequence continuing; `None` when `issued` is beyond
+  `SEQUENCE_MAX`), or give each incarnation a new scope.
+- **Repeats are not honoured.** The refresher keeps nothing about a lease once
+  it is reported, abandoned, reaped or taken over, nor about a waiter once it
+  leaves, so a second `store`, `fail`, `abandon` or `cancel` is
+  `Refusal::Stale` even though the id was provably issued here.
 - **Capacities.** `Refresher<KEYS, FLIGHTS, WAITERS>`. A full table answers
   `EntriesFull`, `FlightsFull` or `WaitersFull`; nothing is evicted. While a
   stale value is servable a full flight table does not refuse the caller: it

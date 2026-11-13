@@ -1,5 +1,5 @@
 //! Leases and the coalesce flights they ride on.
-use coalesce_machines::scoped;
+use periscope_machines::scoped;
 
 use super::{RULES, Small, fetch, revalidation, t, wait};
 use crate::*;
@@ -150,13 +150,20 @@ fn leases_that_were_never_issued_or_belong_elsewhere_name_no_flight() {
     let far_lease = fetch(&mut far, 7, 0);
     assert_eq!(near.flight(far_lease), None);
     assert_eq!(far.flight(near_lease), None);
-    for raw in [0, 1, scoped(1, 2), u64::MAX] {
+    for raw in [0, 1, scoped(1, 3), u64::MAX] {
         assert_eq!(near.flight(Lease::from_raw(raw)), None);
     }
-    // A lease is not its flight: the two are counted separately.
+    // A lease is not its flight, and the flight's id is not a lease: both
+    // come from the one sequence, so they are never equal.
     let flight = near.flight(near_lease).expect("live");
-    assert_eq!(near.flight(Lease::from_raw(flight.raw())), Some(flight));
-    assert_eq!(wait(&mut near, 7, 1).scope(), 1);
+    assert_eq!(
+        (near_lease.raw(), flight.raw()),
+        (scoped(1, 1), scoped(1, 2))
+    );
+    assert_eq!(near.flight(Lease::from_raw(flight.raw())), None);
+    let waiter = wait(&mut near, 7, 1);
+    assert_eq!(waiter.scope(), 1);
+    assert_eq!(near.flight(Lease::from_raw(waiter.raw())), None);
     let second = fetch(&mut near, 8, 1);
     let second_flight = near.flight(second).expect("live");
     assert_ne!(second.raw(), second_flight.raw());

@@ -3,79 +3,18 @@
 
 use core::time::Duration;
 
-use coalesce_machines::{Coalescer, Joined, SEQUENCE_MAX, scoped};
+use coalesce_machines::{Coalescer, Joined};
 pub use coalesce_machines::{FlightId, Notification, Outcome, WaiterId};
 
+mod decision;
 mod lease;
 mod policy;
 mod refusal;
 
+pub use decision::{Decision, Forgetting, Revalidation};
 pub use lease::Lease;
 pub use policy::{Policy, State};
 pub use refusal::Refusal;
-
-/// What is happening about refreshing a stale value that is being served.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Revalidation {
-    /// Nobody was refreshing this key. The caller now is: serve the stale
-    /// value, refresh in the background, report with the lease.
-    Lead(Lease),
-    /// Another caller holds a live lease for this key. Just serve.
-    InFlight,
-    /// The last refresh failed and asked for quiet until this time. Just serve.
-    Backoff {
-        /// When the next caller will be asked to refresh again.
-        until: Duration,
-    },
-    /// A refresh is due but could not be registered, for the reason given.
-    ///
-    /// This is not a refused call: the stale value is still served, so
-    /// [`Refresher::decide`] is honoured and answers
-    /// `Ok(Decision::Stale { .. })`. The failed registration changed nothing
-    /// (no lease, no flight, no waiter); only the clock advances, as for any
-    /// honoured decision. Just serve; the next caller tries again.
-    Unavailable(Refusal),
-}
-
-/// The answer to "may I serve what I have for this key?".
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Decision {
-    /// Serve the cached value.
-    Fresh {
-        /// Its age at `now`.
-        age: Duration,
-    },
-    /// Serve the cached value, stale, and mind the revalidation.
-    Stale {
-        /// Its age at `now`.
-        age: Duration,
-        /// Who refreshes it, if anyone.
-        revalidation: Revalidation,
-    },
-    /// Nothing servable. The caller fetches and reports with the lease.
-    Fetch {
-        /// The right to refresh this key.
-        lease: Lease,
-    },
-    /// Nothing servable and another caller is already fetching. Wait for a
-    /// [`Notification`] carrying this id, then decide again.
-    Wait {
-        /// The caller's notification id.
-        waiter: WaiterId,
-        /// The refresh being shared: what [`Refresher::flight`] answers for
-        /// the key's live lease, and the [`Notification::flight`] to come.
-        flight: FlightId,
-    },
-}
-
-/// What [`Refresher::forget`] did. Both are honoured; neither is a refusal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Forgetting {
-    /// The key had metadata and it was dropped; its slot is free.
-    Forgotten,
-    /// The key had no metadata: an idempotent repeat that changed nothing.
-    NotHeld,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Entry {
@@ -113,8 +52,9 @@ struct Lead {
 pub struct Refresher<const KEYS: usize, const FLIGHTS: usize, const WAITERS: usize> {
     entries: [Option<Entry>; KEYS],
     leads: [Option<Lead>; FLIGHTS],
+    /// Also the one id sequence of this refresher: leases are reserved from
+    /// it, between the flight and waiter ids it issues itself.
     flights: Coalescer<FLIGHTS, WAITERS>,
-    leases: u64,
     now: Duration,
 }
 
@@ -137,20 +77,36 @@ impl<const KEYS: usize, const FLIGHTS: usize, const WAITERS: usize>
 
     /// Start empty at time zero, issuing leases and waiter ids that carry `scope`.
     ///
-    /// Leases and waiter ids are plain integers, so two refreshers in the same
-    /// scope issue the same ones, and an id handed to the wrong refresher can
-    /// name a live lease or waiter there. Give each refresher, and each
-    /// coalescer whose ids could meet it, its own scope: an id from another
-    /// scope is then always [`Refusal::Stale`]. Keeping scopes distinct is
-    /// the caller's job.
+    /// Leases, waiter ids and flight ids all come from the one sequence of
+    /// the coalescer inside: the scope in the top 16 bits, a 48-bit sequence
+    /// below. No two ids of a refresher are equal, whatever their kind, so a
+    /// lease rebuilt as a waiter id, or the reverse, names nothing. Two
+    /// refreshers in the same scope issue the same ids, and an id handed to
+    /// the wrong one can name a live lease or waiter there. Give each
+    /// refresher, and each coalescer whose ids could meet it, its own scope:
+    /// an id from another scope is then always [`Refusal::Stale`]. Keeping
+    /// scopes distinct is the caller's job.
     #[must_use]
     pub const fn with_scope(scope: u16) -> Self {
-        Self {
-            entries: [None; KEYS],
-            leads: [None; FLIGHTS],
-            flights: Coalescer::with_scope(scope),
-            leases: 0,
-            now: Duration::ZERO,
+        Self::over(Coalescer::with_scope(scope))
+    }
+
+    /// Start empty at time zero, the id sequence continuing after `issued`.
+    ///
+    /// For a refresher that replaces an earlier one in the same `scope`, after
+    /// a restart: built with [`Self::with_scope`] it would count from one
+    /// again, and a lease or waiter id that outlived the restart could name a
+    /// new refresh. Save [`Self::issued`] before handing an id out and resume
+    /// from it, or give each incarnation a scope of its own. Every id up to
+    /// `issued` is then [`Refusal::Stale`]. Metadata and time are not resumed.
+    ///
+    /// `None` exactly when [`periscope_machines::Issuer::resumed`] answers
+    /// `None`: `issued` is beyond [`periscope_machines::SEQUENCE_MAX`].
+    #[must_use]
+    pub const fn resumed(scope: u16, issued: u64) -> Option<Self> {
+        match Coalescer::resumed(scope, issued) {
+            Some(flights) => Some(Self::over(flights)),
+            None => None,
         }
     }
 
@@ -158,6 +114,13 @@ impl<const KEYS: usize, const FLIGHTS: usize, const WAITERS: usize>
     #[must_use]
     pub const fn scope(&self) -> u16 {
         self.flights.scope()
+    }
+
+    /// How many ids this refresher has issued, of every kind: leases, waiter
+    /// ids and flight ids. The count to save for [`Self::resumed`].
+    #[must_use]
+    pub const fn issued(&self) -> u64 {
+        self.flights.issued()
     }
 
     /// Decide what a caller asking for `key` at `now` should do.
@@ -168,10 +131,12 @@ impl<const KEYS: usize, const FLIGHTS: usize, const WAITERS: usize>
     ///
     /// # Errors
     ///
-    /// [`Refusal::TimeRegressed`], [`Refusal::Rejected`] for a zero
-    /// `lead_for`, and, only when nothing is servable,
-    /// [`Refusal::FlightsFull`], [`Refusal::WaitersFull`] or
-    /// [`Refusal::Exhausted`]. Nothing changes.
+    /// [`Refusal::TimeRegressed`], then [`Refusal::Rejected`] for a zero
+    /// `lead_for`, and, only when nothing is servable, a full table before a
+    /// spent sequence: [`Refusal::FlightsFull`] or [`Refusal::WaitersFull`],
+    /// then [`Refusal::Exhausted`]. A new refresh takes two ids, its lease and
+    /// its flight, so it is `Exhausted` with one id left; a takeover and a
+    /// wait take one. Nothing changes, and no id is consumed.
     pub fn decide(
         &mut self,
         key: u64,
@@ -546,7 +511,22 @@ impl<const KEYS: usize, const FLIGHTS: usize, const WAITERS: usize>
             .position(|lead| lead.is_some_and(|lead| lead.key == key))
     }
 
+    const fn over(flights: Coalescer<FLIGHTS, WAITERS>) -> Self {
+        Self {
+            entries: [None; KEYS],
+            leads: [None; FLIGHTS],
+            flights,
+            now: Duration::ZERO,
+        }
+    }
+
+    /// The slot and record of a live lease. An id this refresher never
+    /// issued, one from another scope included, is turned away before the
+    /// table is read; an id it issued as a waiter or a flight is in no lead.
     fn held(&self, lease: Lease) -> Option<(usize, Lead)> {
+        if !self.flights.owns(lease.0) {
+            return None;
+        }
         self.leads
             .iter()
             .enumerate()
@@ -554,41 +534,46 @@ impl<const KEYS: usize, const FLIGHTS: usize, const WAITERS: usize>
     }
 
     /// Issue a lease for `key`: a new refresh, or a takeover of an overdue one.
+    ///
+    /// Every check comes before the first id is drawn, so a refused lead
+    /// consumes none: a full table first, the spent sequence last, in the
+    /// order the coalescer itself refuses a join.
     fn lead(&mut self, key: u64, now: Duration, lead_for: Duration) -> Result<Lease, Refusal> {
-        let sequence = self.leases.saturating_add(1);
-        if sequence > SEQUENCE_MAX {
-            return Err(Refusal::Exhausted);
-        }
-        let lease = scoped(self.scope(), sequence);
         let deadline = now.saturating_add(lead_for);
         if let Some(lead) = self
             .lead_slot(key)
             .and_then(|slot| self.leads[slot].as_mut())
         {
+            // A takeover: a new lease on the flight already in the air.
+            let lease = self.flights.reserve()?;
             lead.lease = lease;
             lead.deadline = deadline;
-        } else {
-            let slot = self
-                .leads
-                .iter()
-                .position(Option::is_none)
-                .ok_or(Refusal::FlightsFull)?;
-            let flight = match self.flights.join(key)? {
-                Joined::Leader(flight) => flight,
-                // Unreachable while every flight has a lead; undo and refuse.
-                Joined::Follower { waiter, .. } => {
-                    self.flights.cancel(waiter)?;
-                    return Err(Refusal::Stale);
-                }
-            };
-            self.leads[slot] = Some(Lead {
-                lease,
-                key,
-                flight,
-                deadline,
-            });
+            return Ok(Lease(lease));
         }
-        self.leases = sequence;
+        let slot = self
+            .leads
+            .iter()
+            .position(Option::is_none)
+            .ok_or(Refusal::FlightsFull)?;
+        // A lease and a flight: with one id left, neither is drawn.
+        if self.flights.remaining() < 2 {
+            return Err(Refusal::Exhausted);
+        }
+        let lease = self.flights.reserve()?;
+        let flight = match self.flights.join(key)? {
+            Joined::Leader(flight) => flight,
+            // Unreachable while every flight has a lead; undo and refuse.
+            Joined::Follower { waiter, .. } => {
+                self.flights.cancel(waiter)?;
+                return Err(Refusal::Stale);
+            }
+        };
+        self.leads[slot] = Some(Lead {
+            lease,
+            key,
+            flight,
+            deadline,
+        });
         Ok(Lease(lease))
     }
 

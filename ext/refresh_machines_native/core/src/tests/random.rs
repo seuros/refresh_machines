@@ -23,7 +23,19 @@ fn draw(rng: &mut Rng, model: &Model) -> Draw {
     };
     let live: Vec<u64> = model.flying.values().map(|f| f.lease).collect();
     let lease = if live.is_empty() || rng.below(4) == 0 {
-        rng.below(model.leases + 2)
+        // Any id ever issued, as a lease: real leases, and the waiter and
+        // flight ids between them, which are no lease. Plus one that never
+        // was; one in three from another scope, where the same sequence
+        // number may be live here.
+        let sequence = rng.below(model.issued + 2);
+        if rng.below(3) == 0 {
+            let other = model
+                .scope
+                .wrapping_add(1 + u16::try_from(rng.below(3)).expect("small"));
+            (u64::from(other) << 48) | sequence
+        } else {
+            model.id(sequence)
+        }
     } else {
         live[usize::try_from(rng.below(live.len() as u64)).expect("index")]
     };
@@ -220,8 +232,18 @@ fn sweep(rng: &mut Rng, refresher: &mut Core, model: &mut Model, d: &Draw) {
 
 fn cancel(rng: &mut Rng, refresher: &mut Core, model: &mut Model) {
     let known = model.seen.len() as u64;
+    let live: Vec<u64> = model.flying.values().map(|f| f.lease).collect();
     let waiter = if known == 0 || rng.below(5) == 0 {
         WaiterId::from_raw(rng.next())
+    } else if !live.is_empty() && rng.below(4) == 0 {
+        // A live lease, or the flight it rides on, rebuilt as a waiter id.
+        let lease = live[usize::try_from(rng.below(live.len() as u64)).expect("index")];
+        let flight = refresher.flight(Lease(lease)).expect("a live lease");
+        WaiterId::from_raw([lease, flight.raw()][usize::from(rng.below(2) == 0)])
+    } else if rng.below(5) == 0 {
+        // A waiter that is known here, as another scope would have issued it.
+        let twin = model.seen[usize::try_from(rng.below(known)).expect("index")];
+        WaiterId::from_raw(twin.raw() ^ (1 << 48))
     } else {
         model.seen[usize::try_from(rng.below(known)).expect("index")]
     };
@@ -282,8 +304,14 @@ fn reorder(refresher: &Core, model: &mut Model, before: usize) {
 fn random_operations_agree_with_a_naive_model() {
     for seed in 1..=40_u64 {
         let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
-        let mut refresher = Refresher::<KEYS, FLIGHTS, WAITERS>::new();
-        let mut model = Model::default();
+        // Scope zero, a middling scope and the last one.
+        let scope = [0, 7, u16::MAX][usize::try_from(seed % 3).expect("index")];
+        let mut refresher = Refresher::<KEYS, FLIGHTS, WAITERS>::with_scope(scope);
+        assert_eq!(refresher.scope(), scope);
+        let mut model = Model {
+            scope,
+            ..Model::default()
+        };
         for _ in 0..3_000 {
             step(&mut rng, &mut refresher, &mut model);
             let probe = model.now + rng.below(4);

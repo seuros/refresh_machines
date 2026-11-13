@@ -10,6 +10,10 @@ module RefreshMachines
   type refusal = :time_regressed | :rejected | :entries_full | :flights_full
                | :waiters_full | :exhausted | :stale
 
+  # The scope (0..65_535) a lease, waiter or flight id was issued under: the
+  # top 16 bits. Use it to route an id to the refresher that issued it.
+  def self.scope_of: (Integer id) -> Integer
+
   class Policy < Data
     attr_reader fresh_for: Integer
     attr_reader stale_while_revalidate: Integer
@@ -37,7 +41,8 @@ module RefreshMachines
                 | (age: Integer, revalidation: revalidation) -> Stale
   end
 
-  # Ids are Integers: lease ids, waiter ids and flight ids.
+  # Ids are Integers: lease ids, waiter ids and flight ids, all from the one
+  # sequence of their refresher, so no two ids of a refresher are equal.
   class Fetch < Data
     attr_reader lease: Integer
     def self.new: (Integer lease) -> Fetch
@@ -92,7 +97,14 @@ module RefreshMachines
     def self.new: () -> Refresher
     # `scope` is an Integer in 0..65_535, carried in the top 16 bits of every id.
     def self.with_scope: (Integer scope) -> Refresher
+    # Empty, at time zero, the id sequence continuing after `issued` (a saved
+    # `#issued`): the constructor for a restart. nil when `issued` is beyond
+    # the sequence (more than 2**48 - 1).
+    def self.resumed: (Integer scope, Integer issued) -> Refresher
     def scope: () -> Integer
+    # Ids issued so far, of every kind (leases, waiter ids, flight ids, all
+    # from one sequence): the count to save for `resumed`.
+    def issued: () -> Integer
     # Honoured: Fresh, Stale, Fetch, Wait. Refused: :time_regressed, :rejected,
     # and, only when nothing is servable, :flights_full, :waiters_full, :exhausted.
     def decide: (Integer key, Integer now, Integer lead_for) -> (Fresh | Stale | Fetch | Wait | :time_regressed | :rejected | :flights_full | :waiters_full | :exhausted)

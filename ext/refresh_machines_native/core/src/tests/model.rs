@@ -87,7 +87,9 @@ pub(super) struct Model {
     pub(super) seen: Vec<WaiterId>,
     /// The flight each waiter was told it shares, checked when it is woken.
     pub(super) told: BTreeMap<WaiterId, FlightId>,
-    pub(super) leases: u64,
+    /// Ids issued so far, of every kind: one sequence for the refresher.
+    pub(super) issued: u64,
+    pub(super) scope: u16,
     pub(super) now: u64,
 }
 
@@ -98,6 +100,12 @@ pub(super) const FLIGHTS: usize = 2;
 pub(super) const WAITERS: usize = 3;
 
 impl Model {
+    /// The id of a sequence number, spelled out here rather than borrowed
+    /// from the crate under test: scope in the top 16 bits, sequence below.
+    pub(super) fn id(&self, sequence: u64) -> u64 {
+        (u64::from(self.scope) << 48) | sequence
+    }
+
     pub(super) fn waiters(&self) -> usize {
         self.flying
             .values()
@@ -110,15 +118,18 @@ impl Model {
         if !self.flying.contains_key(&key) && self.flying.len() == FLIGHTS {
             return Err(Refusal::FlightsFull);
         }
-        self.leases += 1;
+        // A new refresh takes a lease and then a flight id; a takeover, the
+        // flight already flying, takes only the lease.
+        let lease = self.id(self.issued + 1);
+        self.issued += if self.flying.contains_key(&key) { 1 } else { 2 };
         let flying = self.flying.entry(key).or_insert_with(|| Flying {
             lease: 0,
             deadline: 0,
             followers: Vec::new(),
         });
-        flying.lease = self.leases;
+        flying.lease = lease;
         flying.deadline = now + lead_for;
-        Ok(self.leases)
+        Ok(lease)
     }
 
     pub(super) fn decide(&mut self, key: u64, now: u64, lead_for: u64) -> Expect {
@@ -189,6 +200,8 @@ pub(super) fn observe(
         Ok(Decision::Fetch { lease }) => Expect::Fetch(lease.raw()),
         Ok(Decision::Wait { waiter, flight }) => {
             assert!(!model.seen.contains(&waiter), "waiter id reissued");
+            model.issued += 1;
+            assert_eq!(waiter.raw(), model.id(model.issued), "the next id");
             let lease = refresher.leading(key).expect("a wait has a leader");
             assert_eq!(
                 refresher.flight(lease),
@@ -208,6 +221,7 @@ pub(super) fn observe(
 
 pub(super) fn agree(refresher: &Core, model: &Model, probe: u64) {
     assert_eq!(refresher.now(), t(model.now));
+    assert_eq!(refresher.issued(), model.issued);
     assert_eq!(refresher.len(), model.held.len());
     assert_eq!(refresher.in_flight(), model.flying.len());
     assert_eq!(refresher.pending(), model.ready.len());

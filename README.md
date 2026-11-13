@@ -117,14 +117,14 @@ sequenceDiagram
     participant O as Origin
 
     A->>R: decide(42, 70s)
-    R-->>A: Stale, Lead lease 2
+    R-->>A: Stale, Lead lease 4
     Note over A: serves the old price
     B->>R: decide(42, 71s)
     R-->>B: Stale :in_flight
     Note over B: serves the old price
     A->>O: fetch 42
     O-->>A: 503
-    A->>R: fail(lease 2, 72s, retry_after 20s)
+    A->>R: fail(lease 4, 72s, retry_after 20s)
     R-->>A: 70s (stale is allowed, it is 70s old)
     B->>R: decide(42, 80s)
     R-->>B: Stale, Backoff until 92s
@@ -158,7 +158,7 @@ t0 = Process.clock_gettime(Process::CLOCK_MONOTONIC, :nanosecond)
 
 fetch = refresher.decide(42, t0, 100 * S)       # key 42, now, lease good for 100s
 fetch.class                                     # => RefreshMachines::Fetch
-wait = refresher.decide(42, t0 + S, 100 * S)    # => #<data RefreshMachines::Wait waiter=2, flight=1>
+wait = refresher.decide(42, t0 + S, 100 * S)    # => #<data RefreshMachines::Wait waiter=3, flight=2>
 wait.flight == refresher.flight(fetch.lease)    # => true
 ```
 
@@ -180,7 +180,7 @@ To record a value you wrote without being asked, use `put(key, now, age, policy)
 
 ```ruby
 stale = refresher.decide(42, t0 + (12 * S), 100 * S)
-stale.revalidation                                          # => #<data RefreshMachines::Lead lease=2>
+stale.revalidation                                          # => #<data RefreshMachines::Lead lease=4>
 lead = stale.revalidation
 refresher.decide(42, t0 + (13 * S), 100 * S).revalidation   # => :in_flight
 refresher.waiting                                           # => 0
@@ -246,13 +246,13 @@ wait = refresher.decide(42, t0 + S, 100 * S)
 flight = refresher.flight(fetch.lease)                 # the refresh this lease rides on
 refresher.store(fetch.lease, t0 + (2 * S), 0, rules)   # => :stored
 refresher.drain(10)
-# => [#<data RefreshMachines::Notification waiter=2, flight=1, key=42, outcome=:completed>]
+# => [#<data RefreshMachines::Notification waiter=3, flight=2, key=42, outcome=:completed>]
 refresher.flight(fetch.lease)                          # => nil, the lease is spent
 ```
 
 A notification has `waiter`, `flight`, `key` and `outcome`, the same four fields in the same order as a `CoalesceMachines::Notification`. `flight` names the refresh that settled, and `flight(lease)` tells you which one a live lease is riding, so you can file the result under it before you report and hand it to the waiters as they wake.
 
-A takeover issues a new lease for the same flight: the heir's lease answers the same flight id, the dead one answers `nil`. So does any lease that was reported, abandoned, reaped, never issued, or issued by a refresher in another scope. Ask while the lease is live. Lease ids and flight ids are counted separately, so don't compare one with the other.
+A takeover issues a new lease for the same flight: the heir's lease answers the same flight id, the dead one answers `nil`. So does any lease that was reported, abandoned, reaped, never issued, or issued by a refresher in another scope. Ask while the lease is live. Lease ids, waiter ids and flight ids all come from one sequence, so no two of them are ever the same number: here the lease is 1, its flight 2 and the waiter 3.
 
 ### Forget and sweep
 
@@ -308,7 +308,10 @@ refresher.decide(1, t0, 0)             # => :rejected, a zero lease is overdue a
 
   Every refusal has its own symbol; there is no catch-all.
 - **A lease is a capability.** Whoever holds the lease id reports the refresh. Reported, abandoned, reaped or taken over, it answers `:stale` forever.
-- **Scopes keep refreshers apart.** Lease and waiter ids are plain Integers counted from 1, so two refreshers issue the same ones, and an id handed to the wrong refresher can name a live lease or waiter there. If you run more than one, or a `CoalesceMachines::Coalescer` beside it, give each its own scope: `Refresher.with_scope(3)`, any Integer in `0..65_535`. `Refresher.new` is scope zero. An id from another scope is always `:stale`. A scope that isn't an Integer raises `TypeError`; out of range raises `RangeError`.
+- **Scopes: ids belong to the refresher that issued them.** Lease, waiter and flight ids are plain Integers, so two refreshers in the same scope issue the same ones, and an id handed to the wrong refresher can name a live lease or waiter there. If you run more than one, or a `CoalesceMachines::Coalescer` beside it, give each its own scope: `Refresher.with_scope(3)`, any Integer in `0..65_535`. `Refresher.new` is scope zero and counts 1, 2, 3 across leases, flights and waiters alike. The scope rides in the top 16 bits of every id, above a 48-bit sequence, and an id from another scope is always `:stale` (`nil` from `flight`). The refresher can't pick a scope for you. `RefreshMachines.scope_of(id)` reads the scope back, so you can route an id to the refresher that issued it. It is the only layout helper the gem has: the layout belongs to the Rust crate `periscope-machines`, which has no gem. A scope that isn't an Integer raises `TypeError`; out of range raises `RangeError`.
+- **One sequence: a lease number is never a waiter number.** Leases, waiter ids and flight ids are bare Integers, so nothing but their values tells them apart, and the refresher draws all three from one sequence: no two ids it issues are equal. Pass a lease to `cancel`, or a waiter or flight id to `store`, `fail`, `abandon` or `flight`, and you get `:stale` (`nil` from `flight`) with nothing changed. A new refresh takes two numbers, its lease and then its flight; a takeover and a wait take one. After `2**48 - 1` of them `decide` answers `:exhausted` wherever it would need an id, and a full table is reported first: `:flights_full` or `:waiters_full` before `:exhausted`.
+- **Restarts: resume the sequence, or take a new scope.** A new refresher counts from one again, so a lease or waiter id that outlived a restart could name a new refresh. Either save `issued` and build the replacement with `Refresher.resumed(scope, issued)`, which is empty, at time zero, and carries on after the saved count (`nil` if `issued` is more than `2**48 - 1`), or give each incarnation a scope it never had before.
+- **Repeats are refused.** A second `store`, `fail`, or `abandon` on a settled lease, and a second `cancel` on a waiter that left, are `:stale`: the refresher keeps nothing about how a lease or waiter ended.
 - **Waiters ask again.** A notification says which refresh settled (`flight`) and how, `:completed` or `:abandoned`. It doesn't carry a decision. Call `decide` again.
 - **Frozen means frozen.** `freeze` the refresher and every mutating call raises `FrozenError`.
 

@@ -1,11 +1,14 @@
 //! Scoped ids: what one refresher issued names nothing in another.
-use coalesce_machines::{Coalescer, Joined, scoped};
+use coalesce_machines::{Coalescer, Joined};
+use periscope_machines::{SEQUENCE_MAX, scoped, sequence_of};
 
-use super::{RULES, Small, fetch, t, wait};
+use super::{RULES, Small, fetch, near_the_end, t, wait};
 use crate::*;
 
+/// The review's sequence: identical calls on two instances, then each is
+/// handed the other's ids through every method that takes one.
 #[test]
-fn scopes_keep_the_leases_and_waiters_of_separate_refreshers_apart() {
+fn regression_a_lease_or_waiter_from_another_refresher_names_nothing_here() {
     let mut near = Small::with_scope(1);
     let mut far = Small::with_scope(2);
     assert_eq!((near.scope(), far.scope(), Small::new().scope()), (1, 2, 0));
@@ -15,23 +18,144 @@ fn scopes_keep_the_leases_and_waiters_of_separate_refreshers_apart() {
     let (near_waiter, far_waiter) = (wait(&mut near, 7, 1), wait(&mut far, 7, 1));
     assert_eq!((near_lease.scope(), near_waiter.scope()), (1, 1));
     assert_eq!((far_lease.scope(), far_waiter.scope()), (2, 2));
-    assert_eq!(near_lease.raw(), scoped(1, 1));
+    assert_eq!(sequence_of(near_lease.raw()), sequence_of(far_lease.raw()));
+    assert_eq!(
+        sequence_of(near_waiter.raw()),
+        sequence_of(far_waiter.raw())
+    );
     assert_ne!(near_lease, far_lease);
     assert_ne!(near_waiter, far_waiter);
 
-    // A foreign lease or waiter is stale here, and the refusal changes nothing.
-    let before = near.clone();
-    assert_eq!(
-        near.store(far_lease, t(2), t(0), RULES),
-        Err(Refusal::Stale)
-    );
-    assert_eq!(near.fail(far_lease, t(2), t(5)), Err(Refusal::Stale));
-    assert_eq!(near.abandon(far_lease), Err(Refusal::Stale));
-    assert_eq!(near.cancel(far_waiter), Err(Refusal::Stale));
-    assert_eq!(near, before);
+    // Each refuses the other's ids and is left unchanged.
+    for (here, lease, waiter) in [
+        (&mut near, far_lease, far_waiter),
+        (&mut far, near_lease, near_waiter),
+    ] {
+        let before = here.clone();
+        assert_eq!(here.store(lease, t(2), t(0), RULES), Err(Refusal::Stale));
+        assert_eq!(here.fail(lease, t(2), t(5)), Err(Refusal::Stale));
+        assert_eq!(here.abandon(lease), Err(Refusal::Stale));
+        assert_eq!(here.cancel(waiter), Err(Refusal::Stale));
+        assert_eq!(here.flight(lease), None);
+        assert_eq!(*here, before);
+    }
+
+    // Their own ids still work.
     assert_eq!(near.store(near_lease, t(2), t(0), RULES), Ok(()));
     assert_eq!(near.poll().map(|note| note.waiter), Some(near_waiter));
     assert_eq!(far.cancel(far_waiter), Ok(()));
+    assert_eq!(far.abandon(far_lease), Ok(()));
+}
+
+#[test]
+fn refreshers_left_in_the_same_scope_still_alias() {
+    // Scopes are the caller's job: nothing tells these two apart.
+    let mut one = Small::with_scope(5);
+    let mut other = Small::with_scope(5);
+    let lease = fetch(&mut one, 7, 0);
+    assert_eq!(lease, fetch(&mut other, 8, 0));
+    let waiter = wait(&mut one, 7, 1);
+    assert_eq!(waiter, wait(&mut other, 8, 1));
+    // Ids from `one` cancel and settle the unrelated refresh in `other`.
+    assert_eq!(other.cancel(waiter), Ok(()));
+    assert_eq!(other.abandon(lease), Ok(()));
+    assert_eq!((one.in_flight(), one.waiting()), (1, 1));
+}
+
+#[test]
+fn raw_values_are_the_published_layout() {
+    // Scope zero is one plain counter for every kind: a refresh takes a
+    // lease then its flight, a wait takes a waiter id.
+    let mut plain = Small::new();
+    let first = fetch(&mut plain, 7, 0);
+    assert_eq!(first.raw(), 1);
+    assert_eq!(plain.flight(first).map(FlightId::raw), Some(2));
+    assert_eq!(wait(&mut plain, 7, 0).raw(), 3);
+    let second = fetch(&mut plain, 8, 0);
+    assert_eq!(second.raw(), 4);
+    assert_eq!(plain.flight(second).map(FlightId::raw), Some(5));
+    assert_eq!(plain.issued(), 5);
+
+    // A scope sits in the top 16 bits above the same counter.
+    let mut top = Small::with_scope(u16::MAX);
+    let lease = fetch(&mut top, 7, 0);
+    assert_eq!(lease.raw(), (0xFFFF << 48) | 1);
+    assert_eq!(lease.raw(), scoped(u16::MAX, 1));
+    assert_eq!(wait(&mut top, 7, 0).raw(), (0xFFFF << 48) | 3);
+    let mut three = Small::with_scope(3);
+    assert_eq!(fetch(&mut three, 7, 0).raw(), 0x0003_0000_0000_0001);
+}
+
+#[test]
+fn a_takeover_issues_the_next_lease_for_the_same_flight() {
+    let mut refresher = Small::with_scope(4);
+    let Ok(Decision::Fetch { lease: dead }) = refresher.decide(7, t(0), t(1)) else {
+        panic!("leads");
+    };
+    let flight = refresher.flight(dead);
+    let heir = fetch(&mut refresher, 7, 5);
+    // The flight took the id between them; the takeover took only a lease.
+    assert_eq!((dead.raw(), heir.raw()), (scoped(4, 1), scoped(4, 3)));
+    assert_eq!(flight.map(FlightId::raw), Some(scoped(4, 2)));
+    assert_eq!(refresher.issued(), 3);
+    assert_eq!(refresher.flight(heir), flight);
+    // The dead lease was issued here, provably, and is stale all the same.
+    let before = refresher.clone();
+    assert_eq!(refresher.flight(dead), None);
+    assert_eq!(
+        refresher.store(dead, t(5), t(0), RULES),
+        Err(Refusal::Stale)
+    );
+    assert_eq!(refresher.fail(dead, t(5), t(1)), Err(Refusal::Stale));
+    assert_eq!(refresher.abandon(dead), Err(Refusal::Stale));
+    assert_eq!(refresher, before);
+    assert_eq!(refresher.store(heir, t(5), t(0), RULES), Ok(()));
+}
+
+#[test]
+fn repeats_stay_stale_because_nothing_records_how_a_lease_ended() {
+    let mut refresher = Small::with_scope(6);
+    let stored = fetch(&mut refresher, 7, 0);
+    let gone = wait(&mut refresher, 7, 0);
+    assert_eq!(refresher.cancel(gone), Ok(()));
+    assert_eq!(refresher.store(stored, t(1), t(0), RULES), Ok(()));
+    let failed = fetch(&mut refresher, 8, 1);
+    assert_eq!(refresher.fail(failed, t(1), t(5)), Ok(None));
+    let dropped = fetch(&mut refresher, 9, 1);
+    assert_eq!(refresher.abandon(dropped), Ok(()));
+
+    let before = refresher.clone();
+    for lease in [stored, failed, dropped] {
+        assert_eq!(
+            refresher.store(lease, t(1), t(0), RULES),
+            Err(Refusal::Stale)
+        );
+        assert_eq!(refresher.fail(lease, t(1), t(5)), Err(Refusal::Stale));
+        assert_eq!(refresher.abandon(lease), Err(Refusal::Stale));
+    }
+    assert_eq!(refresher.cancel(gone), Err(Refusal::Stale));
+    assert_eq!(refresher, before);
+}
+
+#[test]
+fn ids_of_this_scope_that_were_never_issued_are_stale() {
+    let mut refresher = Small::with_scope(4);
+    let lease = fetch(&mut refresher, 7, 0);
+    let before = refresher.clone();
+    for sequence in [0, 3, SEQUENCE_MAX] {
+        let unissued = Lease::from_raw(scoped(4, sequence));
+        assert_eq!(
+            refresher.store(unissued, t(1), t(0), RULES),
+            Err(Refusal::Stale)
+        );
+        assert_eq!(refresher.fail(unissued, t(1), t(5)), Err(Refusal::Stale));
+        assert_eq!(refresher.abandon(unissued), Err(Refusal::Stale));
+        assert_eq!(refresher.flight(unissued), None);
+        let waiter = WaiterId::from_raw(scoped(4, sequence));
+        assert_eq!(refresher.cancel(waiter), Err(Refusal::Stale));
+    }
+    assert_eq!(refresher, before);
+    assert_eq!(refresher.abandon(lease), Ok(()));
 }
 
 #[test]
@@ -40,14 +164,17 @@ fn a_bare_coalescer_in_another_scope_cannot_cancel_a_refresh_waiter() {
     let mut direct = Coalescer::<2, 3>::new();
     fetch(&mut refresher, 7, 0);
     let waiter = wait(&mut refresher, 7, 1);
+    // The same three ids drawn from a coalescer directly: a reserved one
+    // where the refresher drew its lease, then the flight, then the waiter.
+    assert_eq!(direct.reserve(), Ok(1));
     assert_eq!(direct.join(7).map(|_| ()), Ok(()));
     let Ok(Joined::Follower { waiter: twin, .. }) = direct.join(7) else {
         panic!("the second join follows");
     };
 
-    // Same joins, same sequence number, different scope: not the same id.
-    assert_eq!(twin.raw(), 2);
-    assert_eq!(waiter.raw(), scoped(1, 2));
+    // Same sequence number, different scope: not the same id.
+    assert_eq!(twin.raw(), 3);
+    assert_eq!(waiter.raw(), scoped(1, 3));
     let before = refresher.clone();
     assert_eq!(refresher.cancel(twin), Err(Refusal::Stale));
     assert_eq!(refresher, before);
@@ -59,11 +186,50 @@ fn a_bare_coalescer_in_another_scope_cannot_cancel_a_refresh_waiter() {
 }
 
 #[test]
-fn the_last_lease_sequence_is_issued_then_the_scope_is_spent() {
-    let mut refresher = Small::with_scope(u16::MAX);
-    refresher.leases = coalesce_machines::SEQUENCE_MAX - 1;
-    assert_eq!(fetch(&mut refresher, 1, 0).raw(), u64::MAX);
+fn the_last_sequence_is_issued_as_each_kind_then_the_scope_is_spent() {
+    // As a flight: the refresh that takes the last two ids.
+    let mut refresher: Small = near_the_end(u16::MAX, 2);
+    let lease = fetch(&mut refresher, 1, 0);
+    assert_eq!(lease.raw(), u64::MAX - 1);
+    assert_eq!(refresher.flight(lease).map(FlightId::raw), Some(u64::MAX));
     let before = refresher.clone();
     assert_eq!(refresher.decide(2, t(0), t(100)), Err(Refusal::Exhausted));
+    assert_eq!(refresher.decide(1, t(0), t(100)), Err(Refusal::Exhausted));
     assert_eq!(refresher, before);
+
+    // As a waiter id.
+    let mut refresher: Small = near_the_end(u16::MAX, 3);
+    fetch(&mut refresher, 1, 0);
+    assert_eq!(wait(&mut refresher, 1, 0).raw(), u64::MAX);
+    let before = refresher.clone();
+    assert_eq!(refresher.decide(1, t(0), t(100)), Err(Refusal::Exhausted));
+    assert_eq!(refresher, before);
+
+    // As a lease: the takeover of an overdue refresh.
+    let mut refresher: Small = near_the_end(u16::MAX, 3);
+    assert!(refresher.decide(1, t(0), t(1)).is_ok());
+    assert_eq!(fetch(&mut refresher, 1, 5).raw(), u64::MAX);
+    let before = refresher.clone();
+    assert_eq!(refresher.decide(1, t(200), t(100)), Err(Refusal::Exhausted));
+    assert_eq!(refresher.decide(2, t(200), t(100)), Err(Refusal::Exhausted));
+    assert_eq!(refresher, before);
+}
+
+#[test]
+fn a_refused_decide_consumes_no_id() {
+    // Two refresh slots, three waiter slots.
+    let mut refresher = Small::with_scope(9);
+    assert_eq!(fetch(&mut refresher, 1, 0).raw(), scoped(9, 1));
+    assert_eq!(fetch(&mut refresher, 2, 0).raw(), scoped(9, 3));
+    for sequence in 5..=7 {
+        assert_eq!(wait(&mut refresher, 1, 0).raw(), scoped(9, sequence));
+    }
+    let before = refresher.clone();
+    assert_eq!(refresher.decide(3, t(0), t(100)), Err(Refusal::FlightsFull));
+    assert_eq!(refresher.decide(2, t(0), t(100)), Err(Refusal::WaitersFull));
+    assert_eq!(refresher.decide(3, t(0), t(0)), Err(Refusal::Rejected));
+    assert_eq!(refresher, before);
+    assert_eq!(refresher.issued(), 7);
+    assert_eq!(refresher.abandon(Lease::from_raw(scoped(9, 1))), Ok(()));
+    assert_eq!(fetch(&mut refresher, 3, 0).raw(), scoped(9, 8));
 }

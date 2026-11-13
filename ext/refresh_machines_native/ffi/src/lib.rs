@@ -6,10 +6,16 @@ use std::{cell::RefCell, time::Duration};
 use magnus::{
     Error, Integer, RArray, RClass, Ruby, Symbol, TryConvert, Value, prelude::*, typed_data::Obj,
 };
+use periscope_machines::scope_of;
 use refresh_machines::{
     Decision, FlightId, Forgetting, Lease, Notification, Outcome, Policy, Refresher as Core,
     Refusal, Revalidation, State, WaiterId,
 };
+
+/// `RefreshMachines.scope_of(id)`: the scope a lease, waiter or flight id was issued under.
+const fn scope_of_id(id: Number) -> u16 {
+    scope_of(id.0)
+}
 
 const KEY_CAPACITY: usize = 256;
 const FLIGHT_CAPACITY: usize = 64;
@@ -173,8 +179,26 @@ impl Refresher {
         }
     }
 
+    /// Raises `RangeError` when `issued` is beyond the sequence (the core answers `None`).
+    fn resumed(ruby: &Ruby, scope: Scope, issued: Number) -> Result<Self, Error> {
+        Core::resumed(scope.0, issued.0)
+            .map(|core| Self {
+                core: RefCell::new(core),
+            })
+            .ok_or_else(|| {
+                Error::new(
+                    ruby.exception_range_error(),
+                    "issued is past the last sequence of a scope (2**48 - 1)",
+                )
+            })
+    }
+
     fn scope(&self) -> u16 {
         self.core.borrow().scope()
+    }
+
+    fn issued(&self) -> u64 {
+        self.core.borrow().issued()
     }
 
     fn decide(

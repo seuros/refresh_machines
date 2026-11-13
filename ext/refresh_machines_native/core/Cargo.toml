@@ -12,6 +12,7 @@ categories = ["no-std", "algorithms", "caching"]
 
 [dependencies]
 coalesce-machines.workspace = true
+periscope-machines.workspace = true
 
 [lints]
 workspace = true

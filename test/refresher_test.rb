@@ -188,27 +188,79 @@ class RefresherTest < Minitest::Test
     assert_raises(RangeError) { @refresher.flight(2**64) }
   end
 
-  def test_scopes_keep_the_ids_of_separate_refreshers_apart
+  def state(refresher) = [refresher.in_flight, refresher.waiting, refresher.pending]
+
+  # Regression: identical calls on two refreshers issue different ids, and
+  # each refuses the other's through every method that takes one.
+  def test_an_id_from_another_refresher_names_nothing_here
     near = R::Refresher.with_scope(1)
     far = R::Refresher.with_scope(2)
     assert_equal [0, 1, 2], [@refresher.scope, near.scope, far.scope]
-    near_fetch = near.decide(7, 0, 100)
-    far_fetch = far.decide(7, 0, 100)
-    near_wait = near.decide(7, 1, 100)
-    far_wait = far.decide(7, 1, 100)
-    assert_equal (1 << 48) | 1, near_fetch.lease
-    assert_equal (2 << 48) | 2, far_wait.waiter
-    assert_equal 1, @refresher.decide(7, 0, 100).lease # scope zero keeps plain counters
+    near_ids = [near.decide(7, 0, 100).lease, near.decide(7, 1, 100).waiter]
+    far_ids = [far.decide(7, 0, 100).lease, far.decide(7, 1, 100).waiter]
+    # One sequence: the lease, its flight, then the waiter.
+    assert_equal [(1 << 48) | 1, (1 << 48) | 3], near_ids
+    assert_equal [(2 << 48) | 1, (2 << 48) | 3], far_ids
+    assert_equal 1, @refresher.decide(7, 0, 100).lease # scope zero is a plain counter
 
-    # A foreign lease or waiter is stale here, and the refusal changes nothing.
-    assert_equal :stale, near.store(far_fetch.lease, 2, 0, RULES)
-    assert_equal :stale, near.fail(far_fetch.lease, 2, 5)
-    assert_equal :stale, near.abandon(far_fetch.lease)
-    assert_equal :stale, near.cancel(far_wait.waiter)
-    assert_equal [near_fetch.lease, 1, 1, 0], [near.leading(7), near.in_flight, near.waiting, near.pending]
-    assert_equal :stored, near.store(near_fetch.lease, 2, 0, RULES)
-    assert_equal [near_wait.waiter], near.drain(4).map(&:waiter)
-    assert_equal :cancelled, far.cancel(far_wait.waiter)
+    [[near, near_ids, far_ids], [far, far_ids, near_ids]].each do |here, own, (lease, waiter)|
+      assert_equal :stale, here.store(lease, 2, 0, RULES)
+      assert_equal :stale, here.fail(lease, 2, 5)
+      assert_equal :stale, here.abandon(lease)
+      assert_equal :stale, here.cancel(waiter)
+      assert_nil here.flight(lease)
+      assert_equal [own.first, 1, [1, 1, 0]], [here.leading(7), here.now, state(here)]
+    end
+    assert_equal :stored, near.store(near_ids.first, 2, 0, RULES)
+    assert_equal [near_ids.last], near.drain(4).map(&:waiter)
+    assert_equal :cancelled, far.cancel(far_ids.last)
+  end
+
+  def test_refreshers_left_in_the_same_scope_still_alias
+    one = R::Refresher.with_scope(5)
+    other = R::Refresher.with_scope(5)
+    lease = one.decide(7, 0, 100).lease
+    assert_equal lease, other.decide(8, 0, 100).lease
+    waiter = one.decide(7, 0, 100).waiter
+    assert_equal waiter, other.decide(8, 0, 100).waiter
+    # Nothing tells them apart: keeping scopes distinct is the caller's job.
+    assert_equal :cancelled, other.cancel(waiter)
+    assert_equal :abandoned, other.abandon(lease)
+    assert_equal [1, 1, 0], state(one)
+  end
+
+  def test_scope_of_routes_an_id_to_its_refresher
+    assert_equal [0, 0, 3, 65_535], [0, 5, (3 << 48) | 5, MAX].map { R.scope_of(it) }
+    pool = [4, 9].to_h { [it, R::Refresher.with_scope(it)] }
+    fetch = pool[9].decide(1, 0, 100)
+    waiter = pool[9].decide(1, 0, 100).waiter
+    ids = [fetch.lease, waiter, pool[9].flight(fetch.lease)]
+    assert_equal [9, 9, 9], ids.map { R.scope_of(it) }
+    assert_equal :stored, pool.fetch(R.scope_of(fetch.lease)).store(fetch.lease, 1, 0, RULES)
+    assert_raises(RangeError) { R.scope_of(-1) }
+    assert_raises(RangeError) { R.scope_of(2**64) }
+    assert_raises(TypeError) { R.scope_of(1.0) }
+    assert_raises(TypeError) { R.scope_of('1') }
+    assert_raises(TypeError) { R.scope_of(nil) }
+    # The rest of the layout lives in the periscope-machines crate, not here.
+    refute_respond_to R, :scoped
+    refute R.const_defined?(:SEQUENCE_MAX)
+  end
+
+  def test_repeats_on_a_settled_lease_stay_stale
+    stored = @refresher.decide(7, 0, 100).lease
+    gone = @refresher.decide(7, 0, 100).waiter
+    assert_equal :cancelled, @refresher.cancel(gone)
+    assert_equal :stored, @refresher.store(stored, 1, 0, RULES)
+    dropped = @refresher.decide(8, 1, 100).lease
+    assert_equal :abandoned, @refresher.abandon(dropped)
+    [stored, dropped].each do |lease|
+      assert_equal :stale, @refresher.store(lease, 1, 0, RULES)
+      assert_equal :stale, @refresher.fail(lease, 1, 5)
+      assert_equal :stale, @refresher.abandon(lease)
+    end
+    assert_equal :stale, @refresher.cancel(gone)
+    assert_equal [1, [0, 0, 0]], [@refresher.size, state(@refresher)]
   end
 
   def test_scope_must_be_a_sixteen_bit_integer

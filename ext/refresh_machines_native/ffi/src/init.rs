@@ -1,13 +1,14 @@
 //! Private native entry point.
 use crate::{
     FLIGHT_CAPACITY, KEY_CAPACITY, Refresher, WAITER_CAPACITY, policy_if_error, policy_state,
-    policy_while_revalidate,
+    policy_while_revalidate, scope_of_id,
 };
 use magnus::{Error, RClass, Ruby, function, method, prelude::*};
 
 #[magnus::init]
 fn init(ruby: &Ruby) -> Result<(), Error> {
     let module = ruby.define_module("RefreshMachines")?;
+    module.define_singleton_method("scope_of", function!(scope_of_id, 1))?;
     // Policy is a Data class defined in Ruby; its arithmetic lives here.
     let policy: RClass = module.const_get("Policy")?;
     policy.define_method("state", method!(policy_state, 1))?;
@@ -20,7 +21,9 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     class.const_set("WAITER_CAPACITY", WAITER_CAPACITY)?;
     class.define_singleton_method("new", function!(Refresher::new, 0))?;
     class.define_singleton_method("with_scope", function!(Refresher::with_scope, 1))?;
+    class.define_singleton_method("resumed", function!(Refresher::resumed, 2))?;
     class.define_method("scope", method!(Refresher::scope, 0))?;
+    class.define_method("issued", method!(Refresher::issued, 0))?;
     class.define_method("decide", method!(Refresher::decide, 3))?;
     class.define_method("store", method!(Refresher::store, 4))?;
     class.define_method("fail", method!(Refresher::fail, 3))?;

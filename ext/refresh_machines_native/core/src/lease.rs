@@ -1,4 +1,4 @@
-use coalesce_machines::scope_of;
+use periscope_machines::scope_of;
 
 /// The right to refresh one key, and the token that reports how it went.
 ///
