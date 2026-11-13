@@ -52,7 +52,7 @@ fn step(rng: &mut Rng, refresher: &mut Core, model: &mut Model) {
             let expect = model
                 .settle(d.lease, Outcome::Abandoned)
                 .map(|_| ())
-                .ok_or(Refused::Stale);
+                .ok_or(Refusal::Stale);
             assert_eq!(refresher.abandon(Lease(d.lease)), expect);
         }
         14 => reap(refresher, model, &d),
@@ -74,11 +74,11 @@ fn store(refresher: &mut Core, model: &mut Model, d: &Draw) {
         ..
     } = *d;
     let expect = if regressed {
-        Err(Refused::TimeRegressed)
+        Err(Refusal::TimeRegressed)
     } else {
         match model.flying.iter().find(|(_, f)| f.lease == lease) {
-            None => Err(Refused::Stale),
-            Some((key, _)) if !model.room(*key) => Err(Refused::EntriesFull),
+            None => Err(Refusal::Stale),
+            Some((key, _)) if !model.room(*key) => Err(Refusal::EntriesFull),
             Some(_) => Ok(()),
         }
     };
@@ -108,7 +108,7 @@ fn fail(rng: &mut Rng, refresher: &mut Core, model: &mut Model, d: &Draw) {
     let retry_after = rng.below(6);
     let live = model.flying.values().any(|f| f.lease == lease);
     let expect = if regressed {
-        Err(Refused::TimeRegressed)
+        Err(Refusal::TimeRegressed)
     } else if live {
         let key = model.settle(lease, Outcome::Abandoned).expect("live lease");
         model.now = now;
@@ -118,7 +118,7 @@ fn fail(rng: &mut Rng, refresher: &mut Core, model: &mut Model, d: &Draw) {
                 .then(|| u64::try_from(h.age_at(now)).expect("small ages"))
         }))
     } else {
-        Err(Refused::Stale)
+        Err(Refusal::Stale)
     };
     assert_eq!(refresher.fail(Lease(lease), now, retry_after), expect);
 }
@@ -126,7 +126,7 @@ fn fail(rng: &mut Rng, refresher: &mut Core, model: &mut Model, d: &Draw) {
 fn reap(refresher: &mut Core, model: &mut Model, d: &Draw) {
     let Draw { now, regressed, .. } = *d;
     let expect = if regressed {
-        Err(Refused::TimeRegressed)
+        Err(Refusal::TimeRegressed)
     } else {
         let overdue: Vec<u64> = model
             .flying
@@ -160,7 +160,7 @@ fn put(refresher: &mut Core, model: &mut Model, d: &Draw) {
         ..
     } = *d;
     let expect = if regressed {
-        Err(Refused::TimeRegressed)
+        Err(Refusal::TimeRegressed)
     } else if model.room(key) {
         model.held.insert(
             key,
@@ -174,18 +174,18 @@ fn put(refresher: &mut Core, model: &mut Model, d: &Draw) {
         model.now = now;
         Ok(())
     } else {
-        Err(Refused::EntriesFull)
+        Err(Refusal::EntriesFull)
     };
     assert_eq!(refresher.put(key, now, age, policy), expect);
 }
 
 fn sweep(rng: &mut Rng, refresher: &mut Core, model: &mut Model, d: &Draw) {
     let Draw { now, regressed, .. } = *d;
-    let mut out = [None; 2];
+    let mut out = [u64::MAX; 2];
     let room = usize::try_from(rng.below(3)).expect("index");
     let found = refresher.sweep(now, &mut out[..room]);
     if regressed {
-        assert_eq!(found, Err(Refused::TimeRegressed));
+        assert_eq!(found, Err(Refusal::TimeRegressed));
         return;
     }
     let gone = |h: &Held| !h.fresh(now) && !h.swr(now) && !h.sie(now);
@@ -195,8 +195,10 @@ fn sweep(rng: &mut Rng, refresher: &mut Core, model: &mut Model, d: &Draw) {
         .filter(|(key, h)| gone(h) && !model.flying.contains_key(key))
         .map(|(key, _)| *key)
         .collect();
-    assert_eq!(found, Ok(eligible.len().min(room)));
-    for key in out.iter().flatten() {
+    let written = eligible.len().min(room);
+    assert_eq!(found, Ok(written));
+    assert!(out[written..].iter().all(|key| *key == u64::MAX));
+    for key in &out[..written] {
         assert!(eligible.contains(key), "swept a live key {key}");
         assert!(model.held.remove(key).is_some(), "swept {key} twice");
     }
@@ -223,18 +225,22 @@ fn cancel(rng: &mut Rng, refresher: &mut Core, model: &mut Model) {
                 f.followers.remove(index);
                 Some(())
             })
-            .ok_or(Refused::Stale)
+            .ok_or(Refusal::Stale)
     };
     assert_eq!(refresher.cancel(waiter), expect);
 }
 
 fn drain(rng: &mut Rng, refresher: &mut Core, model: &mut Model) {
-    let mut out = [None; 2];
+    let mut out = [Notification::default(); 2];
     let room = usize::try_from(rng.below(3)).expect("index");
     let written = refresher.drain(&mut out[..room]);
     assert_eq!(written, model.ready.len().min(room));
+    assert!(
+        out[written..]
+            .iter()
+            .all(|note| *note == Notification::default())
+    );
     for note in out.iter().take(written) {
-        let note = note.expect("written entries are Some");
         let expect = model.ready.pop_front().expect("model has it queued");
         assert_eq!((note.waiter, note.key, note.outcome), expect);
     }

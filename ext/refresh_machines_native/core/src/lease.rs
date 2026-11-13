@@ -4,7 +4,7 @@ use coalesce_machines::scope_of;
 ///
 /// Issued by [`crate::Refresher::decide`]. Never reissued: once the refresh is
 /// reported, abandoned, reaped or taken over, the lease is
-/// [`crate::Refused::Stale`] forever.
+/// [`crate::Refusal::Stale`] forever.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Lease(pub(crate) u64);
 

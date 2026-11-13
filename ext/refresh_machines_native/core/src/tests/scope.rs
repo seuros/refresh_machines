@@ -21,10 +21,10 @@ fn scopes_keep_the_leases_and_waiters_of_separate_refreshers_apart() {
 
     // A foreign lease or waiter is stale here, and the refusal changes nothing.
     let before = near.clone();
-    assert_eq!(near.store(far_lease, 2, 0, RULES), Err(Refused::Stale));
-    assert_eq!(near.fail(far_lease, 2, 5), Err(Refused::Stale));
-    assert_eq!(near.abandon(far_lease), Err(Refused::Stale));
-    assert_eq!(near.cancel(far_waiter), Err(Refused::Stale));
+    assert_eq!(near.store(far_lease, 2, 0, RULES), Err(Refusal::Stale));
+    assert_eq!(near.fail(far_lease, 2, 5), Err(Refusal::Stale));
+    assert_eq!(near.abandon(far_lease), Err(Refusal::Stale));
+    assert_eq!(near.cancel(far_waiter), Err(Refusal::Stale));
     assert_eq!(near, before);
     assert_eq!(near.store(near_lease, 2, 0, RULES), Ok(()));
     assert_eq!(near.poll().map(|note| note.waiter), Some(near_waiter));
@@ -46,11 +46,11 @@ fn a_bare_coalescer_in_another_scope_cannot_cancel_a_refresh_waiter() {
     assert_eq!(twin.raw(), 2);
     assert_eq!(waiter.raw(), scoped(1, 2));
     let before = refresher.clone();
-    assert_eq!(refresher.cancel(twin), Err(Refused::Stale));
+    assert_eq!(refresher.cancel(twin), Err(Refusal::Stale));
     assert_eq!(refresher, before);
     assert_eq!(
         direct.cancel(waiter),
-        Err(coalesce_machines::Refused::Stale)
+        Err(coalesce_machines::Refusal::Stale)
     );
     assert_eq!(refresher.cancel(waiter), Ok(()));
 }
@@ -61,6 +61,6 @@ fn the_last_lease_sequence_is_issued_then_the_scope_is_spent() {
     refresher.leases = coalesce_machines::SEQUENCE_MAX - 1;
     assert_eq!(fetch(&mut refresher, 1, 0).raw(), u64::MAX);
     let before = refresher.clone();
-    assert_eq!(refresher.decide(2, 0, 100), Err(Refused::Exhausted));
+    assert_eq!(refresher.decide(2, 0, 100), Err(Refusal::Exhausted));
     assert_eq!(refresher, before);
 }

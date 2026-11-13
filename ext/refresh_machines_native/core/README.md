@@ -50,7 +50,7 @@ assert_eq!(
 ## Contract
 
 - **Time and ages.** Every mutating call takes `now` in the caller's unit and
-  refuses an earlier one with `Refused::TimeRegressed`. `store` and `put` take
+  refuses an earlier one with `Refusal::TimeRegressed`. `store` and `put` take
   the value's age on arrival, so a response that was already old upstream
   starts old here. Ages, deadlines and backoffs saturate at `u64::MAX`.
 - **Windows.** Fresh while `age < fresh_for`. Both stale windows open when
@@ -66,17 +66,32 @@ assert_eq!(
   a capability: whoever holds it reports the refresh. It carries a deadline
   (`now + lead_for`); once that passes, the next caller needing a refresh takes
   it over, and `reap` revokes overdue leases nobody replaced. A taken-over,
-  reaped, reported or abandoned lease is `Refused::Stale` forever.
+  reaped, reported or abandoned lease is `Refusal::Stale` forever.
 - **Waiters.** `Wait` returns a `WaiterId`. When the refresh settles each waiter
   gets one `Notification` (`Completed` after `store`, `Abandoned` after `fail`,
   `abandon` or `reap`) through `poll` or `drain`, then decides again. A takeover
   keeps the waiters. `cancel` withdraws one.
+- **Leases and flights.** Each refresh rides one `coalesce-machines` flight,
+  and `Notification::flight` names it. `flight(lease)` answers the `FlightId`
+  a live lease rides on, so a notification can be tied back to the lease that
+  caused it. A takeover issues a new lease for the same flight: the new lease
+  answers the old one's flight and the old one answers `None`, as does any
+  stale lease or one from another scope. The mapping ends when the refresh
+  settles, so record it while the lease is live. Leases and flights are counted
+  separately; do not compare their raw values.
+- **Output buffers.** `drain(out: &mut [Notification])` and
+  `sweep(now, out: &mut [u64])` write the first `n` entries, return `n` and
+  leave the rest untouched. `[Notification::default(); N]` and `[0; N]` size
+  them; the default notification is a placeholder that is never emitted (its
+  ids are raw zero, never issued). Read only the `n` entries reported.
+- **Naming.** The refusal enum is `Refusal`. `Refused` remains as a deprecated
+  alias for one release.
 - **Scopes.** Leases and waiter ids are plain integers, so two refreshers in
   the same scope issue the same ones. `Refresher::with_scope(scope)` puts a
   caller-chosen `u16` in the top 16 bits of every lease and waiter id, using the
   `coalesce-machines` layout; an id from another refresher or coalescer in a
-  different scope is always `Refused::Stale`. `new()` is scope zero. After
-  2^48 - 1 leases `decide` answers `Refused::Exhausted`.
+  different scope is always `Refusal::Stale`. `new()` is scope zero. After
+  2^48 - 1 leases `decide` answers `Refusal::Exhausted`.
 - **Capacities.** `Refresher<KEYS, FLIGHTS, WAITERS>`. A full table answers
   `EntriesFull`, `FlightsFull` or `WaitersFull`; nothing is evicted. While a
   stale value is servable a full flight table does not refuse the caller: it

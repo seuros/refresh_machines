@@ -10,8 +10,8 @@ use magnus::{
     typed_data::Obj,
 };
 use refresh_machines::{
-    Decision, Lease, Notification, Outcome, Policy, Refresher as Core, Refused, Revalidation,
-    State, WaiterId,
+    Decision, FlightId, Lease, Notification, Outcome, Policy, Refresher as Core, Refusal,
+    Revalidation, State, WaiterId,
 };
 
 const KEY_CAPACITY: usize = 256;
@@ -76,23 +76,23 @@ impl TryConvert for Rules {
     }
 }
 
-const fn refusal_name(refused: Refused) -> &'static str {
+const fn refusal_name(refused: Refusal) -> &'static str {
     match refused {
-        Refused::TimeRegressed => "time_regressed",
-        Refused::Rejected => "rejected",
-        Refused::EntriesFull => "entries_full",
-        Refused::FlightsFull => "flights_full",
-        Refused::WaitersFull => "waiters_full",
-        Refused::Exhausted => "exhausted",
+        Refusal::TimeRegressed => "time_regressed",
+        Refusal::Rejected => "rejected",
+        Refusal::EntriesFull => "entries_full",
+        Refusal::FlightsFull => "flights_full",
+        Refusal::WaitersFull => "waiters_full",
+        Refusal::Exhausted => "exhausted",
         _ => "stale",
     }
 }
 
-fn refusal(ruby: &Ruby, refused: Refused) -> Value {
+fn refusal(ruby: &Ruby, refused: Refusal) -> Value {
     ruby.to_symbol(refusal_name(refused)).as_value()
 }
 
-fn done(ruby: &Ruby, outcome: Result<(), Refused>, name: &str) -> Value {
+fn done(ruby: &Ruby, outcome: Result<(), Refusal>, name: &str) -> Value {
     match outcome {
         Ok(()) => ruby.to_symbol(name).as_value(),
         Err(refused) => refusal(ruby, refused),
@@ -245,14 +245,14 @@ impl Refresher {
     fn sweep(ruby: &Ruby, this: Obj<Self>, now: Number, max: Number) -> Result<Value, Error> {
         this.check_frozen()?;
         let room = usize::try_from(max.0).map_or(KEY_CAPACITY, |max| max.min(KEY_CAPACITY));
-        let mut buffer: [Option<u64>; KEY_CAPACITY] = [None; KEY_CAPACITY];
+        let mut buffer = [0_u64; KEY_CAPACITY];
         let outcome = this.core.borrow_mut().sweep(now.0, &mut buffer[..room]);
         let written = match outcome {
             Ok(written) => written,
             Err(refused) => return Ok(refusal(ruby, refused)),
         };
         let keys = ruby.ary_new_capa(written);
-        for key in buffer.iter().take(written).flatten() {
+        for key in buffer.iter().take(written) {
             keys.push(*key)?;
         }
         Ok(keys.as_value())
@@ -272,15 +272,18 @@ impl Refresher {
         // Resolve the class before taking anything, so a failure loses nothing.
         let class = data(ruby, "Notification")?;
         let room = usize::try_from(max.0).map_or(WAITER_CAPACITY, |max| max.min(WAITER_CAPACITY));
-        let mut buffer: [Option<Notification>; WAITER_CAPACITY] = [None; WAITER_CAPACITY];
+        let mut buffer = [Notification::default(); WAITER_CAPACITY];
         let written = this.core.borrow_mut().drain(&mut buffer[..room]);
         let notifications = ruby.ary_new_capa(written);
-        for note in buffer.iter().take(written).flatten() {
+        for note in buffer.iter().take(written) {
             let outcome = ruby.to_symbol(match note.outcome {
                 Outcome::Completed => "completed",
                 Outcome::Abandoned => "abandoned",
             });
-            let value: Value = class.funcall("new", (note.waiter.raw(), note.key, outcome))?;
+            let value: Value = class.funcall(
+                "new",
+                (note.waiter.raw(), note.flight.raw(), note.key, outcome),
+            )?;
             notifications.push(value)?;
         }
         Ok(notifications)
@@ -301,6 +304,13 @@ impl Refresher {
 
     fn leading(&self, key: Number) -> Option<u64> {
         self.core.borrow().leading(key.0).map(Lease::raw)
+    }
+
+    fn flight(&self, lease_id: Number) -> Option<u64> {
+        self.core
+            .borrow()
+            .flight(Lease::from_raw(lease_id.0))
+            .map(FlightId::raw)
     }
 
     fn now(&self) -> u64 {

@@ -220,6 +220,23 @@ refresher.reap(20)                      # => 1
 
 A worker that dies holding a lease would otherwise hold the key forever. At the deadline the next caller who needs a refresh takes it over, and the old lease is refused from then on. Waiters stay parked and are woken by the new leader. `reap(now)` revokes overdue leases nobody came back for, so their waiters get `:abandoned` instead of silence.
 
+### Notifications and flights
+
+```ruby
+refresher = RefreshMachines::Refresher.new
+fetch = refresher.decide(42, 0, 100)
+wait = refresher.decide(42, 1, 100)
+flight_id = refresher.flight(fetch.lease_id)   # the refresh this lease rides on
+refresher.store(fetch.lease_id, 2, 0, rules)   # => :stored
+refresher.drain(10)
+# => [#<data RefreshMachines::Notification waiter_id=2, flight_id=1, key=42, outcome=:completed>]
+refresher.flight(fetch.lease_id)               # => nil, the lease is spent
+```
+
+A notification has `waiter_id`, `flight_id`, `key` and `outcome`, the same four fields in the same order as a `CoalesceMachines::Notification`. `flight_id` names the refresh that settled, and `flight(lease_id)` tells you which one a live lease is riding, so you can file the result under it before you report and hand it to the waiters as they wake.
+
+A takeover issues a new lease for the same flight: the heir's `lease_id` answers the same `flight_id`, the dead one answers `nil`. So does any lease that was reported, abandoned, reaped, never issued, or issued by a refresher in another scope. Ask while the lease is live. Lease ids and flight ids are counted separately, so don't compare one with the other.
+
 ### Forget and sweep
 
 ```ruby
@@ -257,7 +274,7 @@ refresher.decide(1, 10, 0)       # => :rejected, a zero lease is overdue at birt
 - **Refusals don't raise.** `:time_regressed`, `:rejected`, `:entries_full`, `:flights_full`, `:waiters_full`, `:exhausted` and `:stale` are answers, and a refused call changes nothing.
 - **A lease is a capability.** Whoever holds the `lease_id` reports the refresh. Reported, abandoned, reaped or taken over, it answers `:stale` forever.
 - **Scopes keep refreshers apart.** Lease and waiter ids are plain Integers counted from 1, so two refreshers issue the same ones, and an id handed to the wrong refresher can name a live lease or waiter there. If you run more than one, or a `CoalesceMachines::Coalescer` beside it, give each its own scope: `Refresher.new(scope: 3)`, any Integer in `0..65_535`. An id from another scope is always `:stale`. A `scope:` that isn't an Integer raises `TypeError`; out of range raises `RangeError`.
-- **Waiters ask again.** A notification says the refresh settled, `:completed` or `:abandoned`. It doesn't carry a decision. Call `decide` again.
+- **Waiters ask again.** A notification says which refresh settled (`flight_id`) and how, `:completed` or `:abandoned`. It doesn't carry a decision. Call `decide` again.
 - **Frozen means frozen.** `freeze` the refresher and every mutating call raises `FrozenError`.
 
 ## What You Think You're Doing vs Reality

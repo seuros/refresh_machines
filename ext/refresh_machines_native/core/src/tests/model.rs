@@ -63,7 +63,7 @@ pub(super) enum Expect {
     Stale(u64, Revalidation),
     Fetch(u64),
     Wait,
-    Refused(Refused),
+    Refusal(Refusal),
 }
 
 #[derive(Default)]
@@ -91,9 +91,9 @@ impl Model {
             + self.ready.len()
     }
 
-    pub(super) fn lead(&mut self, key: u64, now: u64, lead_for: u64) -> Result<u64, Refused> {
+    pub(super) fn lead(&mut self, key: u64, now: u64, lead_for: u64) -> Result<u64, Refusal> {
         if !self.flying.contains_key(&key) && self.flying.len() == FLIGHTS {
-            return Err(Refused::FlightsFull);
+            return Err(Refusal::FlightsFull);
         }
         self.leases += 1;
         let flying = self.flying.entry(key).or_insert_with(|| Flying {
@@ -108,10 +108,10 @@ impl Model {
 
     pub(super) fn decide(&mut self, key: u64, now: u64, lead_for: u64) -> Expect {
         if now < self.now {
-            return Expect::Refused(Refused::TimeRegressed);
+            return Expect::Refusal(Refusal::TimeRegressed);
         }
         if lead_for == 0 {
-            return Expect::Refused(Refused::Rejected);
+            return Expect::Refusal(Refusal::Rejected);
         }
         let live = self.flying.get(&key).is_some_and(|f| now < f.deadline);
         let held = self.held.get(&key).copied();
@@ -134,13 +134,13 @@ impl Model {
             }
             _ if live => {
                 if self.waiters() == WAITERS {
-                    return Expect::Refused(Refused::WaitersFull);
+                    return Expect::Refusal(Refusal::WaitersFull);
                 }
                 Expect::Wait
             }
             _ => match self.lead(key, now, lead_for) {
                 Ok(lease) => Expect::Fetch(lease),
-                Err(refused) => return Expect::Refused(refused),
+                Err(refused) => return Expect::Refusal(refused),
             },
         };
         self.now = now;
@@ -160,7 +160,7 @@ impl Model {
     }
 }
 
-pub(super) fn observe(found: Result<Decision, Refused>, model: &mut Model, key: u64) -> Expect {
+pub(super) fn observe(found: Result<Decision, Refusal>, model: &mut Model, key: u64) -> Expect {
     match found {
         Ok(Decision::Fresh { age }) => Expect::Fresh(age),
         Ok(Decision::Stale { age, revalidation }) => Expect::Stale(age, revalidation),
@@ -173,7 +173,7 @@ pub(super) fn observe(found: Result<Decision, Refused>, model: &mut Model, key: 
             }
             Expect::Wait
         }
-        Err(refused) => Expect::Refused(refused),
+        Err(refused) => Expect::Refusal(refused),
     }
 }
 

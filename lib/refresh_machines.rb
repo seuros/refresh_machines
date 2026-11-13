@@ -17,8 +17,9 @@ module RefreshMachines
   Fetch = Data.define(:lease_id, :key)
   # Nothing servable and someone is already fetching: park under `waiter_id`.
   Wait = Data.define(:waiter_id, :key)
-  # One waiter to wake. `outcome` is :completed or :abandoned.
-  Notification = Data.define(:waiter_id, :key, :outcome)
+  # One waiter to wake. `flight_id` names the refresh that settled, see
+  # `Refresher#flight`. `outcome` is :completed or :abandoned.
+  Notification = Data.define(:waiter_id, :flight_id, :key, :outcome)
 end
 
 # Native is required: no algorithm fallback. It builds the Data values above

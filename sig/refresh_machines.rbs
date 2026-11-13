@@ -51,10 +51,11 @@ module RefreshMachines
     type outcome = :completed | :abandoned
 
     attr_reader waiter_id: Integer
+    attr_reader flight_id: Integer
     attr_reader key: Integer
     attr_reader outcome: outcome
-    def self.new: (Integer waiter_id, Integer key, outcome outcome) -> Notification
-                | (waiter_id: Integer, key: Integer, outcome: outcome) -> Notification
+    def self.new: (Integer waiter_id, Integer flight_id, Integer key, outcome outcome) -> Notification
+                | (waiter_id: Integer, flight_id: Integer, key: Integer, outcome: outcome) -> Notification
   end
 
   class Refresher
@@ -78,6 +79,7 @@ module RefreshMachines
     def state: (Integer key, Integer now) -> state?
     def stale_if_error: (Integer key, Integer now) -> Integer?
     def leading: (Integer key) -> Integer?
+    def flight: (Integer lease_id) -> Integer?
     def now: () -> Integer
     def size: () -> Integer
     def in_flight: () -> Integer

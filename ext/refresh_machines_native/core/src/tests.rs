@@ -3,9 +3,11 @@ extern crate std;
 
 use super::*;
 
+mod flight;
 mod model;
 mod random;
 mod scope;
+mod sweep;
 
 const MAX: u64 = u64::MAX;
 const RULES: Policy = Policy::new(10, 5, 20);
@@ -34,7 +36,7 @@ fn wait<const K: usize, const F: usize, const W: usize>(
     }
 }
 
-fn revalidation(decision: Result<Decision, Refused>) -> (u64, Revalidation) {
+fn revalidation(decision: Result<Decision, Refusal>) -> (u64, Revalidation) {
     match decision {
         Ok(Decision::Stale { age, revalidation }) => (age, revalidation),
         other => panic!("expected a stale value, got {other:?}"),
@@ -93,11 +95,11 @@ fn miss_is_fetched_once_and_waiters_are_notified_when_it_lands() {
         (note.waiter, note.key, note.outcome),
         (first, 42, Outcome::Completed)
     );
-    let mut out = [None; 4];
+    let mut out = [Notification::default(); 4];
     assert_eq!(refresher.drain(&mut out), 1);
-    assert_eq!(out[0].map(|note| note.waiter), Some(second));
+    assert_eq!(out[0].waiter, second);
     assert_eq!(refresher.decide(42, 4, 100), Ok(Decision::Fresh { age: 1 }));
-    assert_eq!(refresher.store(lease, 4, 0, RULES), Err(Refused::Stale));
+    assert_eq!(refresher.store(lease, 4, 0, RULES), Err(Refusal::Stale));
     assert_eq!(refresher.leading(42), None);
 }
 
@@ -189,8 +191,8 @@ fn abandon_records_no_failure_and_the_next_caller_leads() {
     let lease = fetch(&mut refresher, 7, 20);
     let waiter = wait(&mut refresher, 7, 20);
     assert_eq!(refresher.abandon(lease), Ok(()));
-    assert_eq!(refresher.abandon(lease), Err(Refused::Stale));
-    assert_eq!(refresher.fail(lease, 20, 1), Err(Refused::Stale));
+    assert_eq!(refresher.abandon(lease), Err(Refusal::Stale));
+    assert_eq!(refresher.fail(lease, 20, 1), Err(Refusal::Stale));
     assert_eq!(refresher.poll().map(|note| note.waiter), Some(waiter));
     assert_ne!(fetch(&mut refresher, 7, 20), lease);
 }
@@ -209,9 +211,9 @@ fn overdue_lease_is_taken_over_and_waiters_follow_the_new_leader() {
     assert_ne!(lease, dead);
     assert_eq!(refresher.leading(5), Some(lease));
     assert_eq!((refresher.in_flight(), refresher.waiting()), (1, 1));
-    assert_eq!(refresher.store(dead, 11, 0, RULES), Err(Refused::Stale));
-    assert_eq!(refresher.fail(dead, 11, 0), Err(Refused::Stale));
-    assert_eq!(refresher.abandon(dead), Err(Refused::Stale));
+    assert_eq!(refresher.store(dead, 11, 0, RULES), Err(Refusal::Stale));
+    assert_eq!(refresher.fail(dead, 11, 0), Err(Refusal::Stale));
+    assert_eq!(refresher.abandon(dead), Err(Refusal::Stale));
     assert_eq!(refresher.store(lease, 12, 0, RULES), Ok(()));
     let note = refresher.poll().expect("waiter kept across the takeover");
     assert_eq!((note.waiter, note.outcome), (waiter, Outcome::Completed));
@@ -241,11 +243,11 @@ fn reap_revokes_overdue_leases_and_wakes_their_waiters() {
     let waiter = wait(&mut refresher, 1, 1);
     assert_eq!(refresher.reap(4), Ok(0));
     assert_eq!(refresher.reap(5), Ok(1));
-    assert_eq!(refresher.store(slow, 5, 0, RULES), Err(Refused::Stale));
+    assert_eq!(refresher.store(slow, 5, 0, RULES), Err(Refusal::Stale));
     let note = refresher.poll().expect("waiter woken");
     assert_eq!((note.waiter, note.outcome), (waiter, Outcome::Abandoned));
     assert_eq!(refresher.leading(2), Some(patient));
-    assert_eq!(refresher.reap(4), Err(Refused::TimeRegressed));
+    assert_eq!(refresher.reap(4), Err(Refusal::TimeRegressed));
     // An overdue lease nobody reaped or replaced still reports.
     assert_eq!(refresher.store(patient, 90, 0, RULES), Ok(()));
 }
@@ -256,15 +258,15 @@ fn capacity_refusals_change_nothing() {
     let one = fetch(&mut refresher, 1, 0);
     let two = fetch(&mut refresher, 2, 0);
     let before = refresher.clone();
-    assert_eq!(refresher.decide(3, 0, 100), Err(Refused::FlightsFull));
+    assert_eq!(refresher.decide(3, 0, 100), Err(Refusal::FlightsFull));
     assert_eq!(refresher, before);
 
     for _ in 0..3 {
         wait(&mut refresher, 1, 0);
     }
     let before = refresher.clone();
-    assert_eq!(refresher.decide(2, 5, 100), Err(Refused::WaitersFull));
-    assert_eq!(refresher.decide(1, 5, 0), Err(Refused::Rejected));
+    assert_eq!(refresher.decide(2, 5, 100), Err(Refusal::WaitersFull));
+    assert_eq!(refresher.decide(1, 5, 0), Err(Refusal::Rejected));
     assert_eq!(refresher, before);
     assert_eq!(refresher.now(), 0);
 
@@ -273,8 +275,8 @@ fn capacity_refusals_change_nothing() {
     assert_eq!(refresher.put(9, 0, 0, RULES), Ok(()));
     assert_eq!((refresher.len(), refresher.capacity()), (3, 3));
     let before = refresher.clone();
-    assert_eq!(refresher.put(10, 0, 0, RULES), Err(Refused::EntriesFull));
-    assert_eq!(refresher.store(two, 0, 0, RULES), Err(Refused::EntriesFull));
+    assert_eq!(refresher.put(10, 0, 0, RULES), Err(Refusal::EntriesFull));
+    assert_eq!(refresher.store(two, 0, 0, RULES), Err(Refusal::EntriesFull));
     assert_eq!(refresher, before);
     // The lease survived the refusal: make room and report again.
     assert!(refresher.forget(9));
@@ -293,11 +295,11 @@ fn stale_value_is_still_served_when_the_revalidation_cannot_be_registered() {
     fetch(&mut refresher, 2, 0);
     assert_eq!(
         revalidation(refresher.decide(7, 11, 100)),
-        (11, Revalidation::Unavailable(Refused::FlightsFull))
+        (11, Revalidation::Unavailable(Refusal::FlightsFull))
     );
     assert_eq!(refresher.now(), 11);
     // Past the window there is nothing to serve, so the refusal is the answer.
-    assert_eq!(refresher.decide(7, 15, 100), Err(Refused::FlightsFull));
+    assert_eq!(refresher.decide(7, 15, 100), Err(Refusal::FlightsFull));
     assert_eq!(refresher.now(), 11);
 }
 
@@ -306,44 +308,21 @@ fn time_regression_is_refused_everywhere_and_changes_nothing() {
     let mut refresher = Small::new();
     let lease = fetch(&mut refresher, 1, 10);
     let before = refresher.clone();
-    let mut out = [None; 2];
-    assert_eq!(refresher.decide(1, 9, 100), Err(Refused::TimeRegressed));
+    let mut out = [77; 2];
+    assert_eq!(refresher.decide(1, 9, 100), Err(Refusal::TimeRegressed));
     assert_eq!(
         refresher.store(lease, 9, 0, RULES),
-        Err(Refused::TimeRegressed)
+        Err(Refusal::TimeRegressed)
     );
-    assert_eq!(refresher.fail(lease, 9, 0), Err(Refused::TimeRegressed));
-    assert_eq!(refresher.put(2, 9, 0, RULES), Err(Refused::TimeRegressed));
-    assert_eq!(refresher.reap(9), Err(Refused::TimeRegressed));
-    assert_eq!(refresher.sweep(9, &mut out), Err(Refused::TimeRegressed));
+    assert_eq!(refresher.fail(lease, 9, 0), Err(Refusal::TimeRegressed));
+    assert_eq!(refresher.put(2, 9, 0, RULES), Err(Refusal::TimeRegressed));
+    assert_eq!(refresher.reap(9), Err(Refusal::TimeRegressed));
+    assert_eq!(refresher.sweep(9, &mut out), Err(Refusal::TimeRegressed));
+    assert_eq!(out, [77; 2]);
     assert_eq!(refresher, before);
     assert_eq!(refresher.store(lease, 10, 0, RULES), Ok(()));
     // Queries are pure: an earlier time reads the age the value was stored with.
     assert_eq!(refresher.age(1, 3), Some(0));
-}
-
-#[test]
-fn sweep_drops_expired_metadata_in_bounded_resumable_batches() {
-    let mut refresher = Refresher::<4, 2, 2>::new();
-    for key in 0..3 {
-        assert_eq!(refresher.put(key, 0, 0, Policy::new(1, 0, 0)), Ok(()));
-    }
-    assert_eq!(refresher.put(3, 0, 0, RULES), Ok(()));
-    let busy = fetch(&mut refresher, 2, 5);
-    let mut out = [None; 1];
-    assert_eq!(refresher.sweep(5, &mut []), Ok(0));
-    assert_eq!(refresher.sweep(5, &mut out), Ok(1));
-    assert_eq!(out, [Some(0)]);
-    let mut out = [None; 4];
-    assert_eq!(refresher.sweep(5, &mut out), Ok(1));
-    assert_eq!(out, [Some(1), None, None, None]);
-    // Key 2 is expired but being refetched; key 3 is still fresh.
-    assert_eq!(refresher.sweep(5, &mut out), Ok(0));
-    assert_eq!(refresher.len(), 2);
-    assert_eq!(refresher.abandon(busy), Ok(()));
-    assert_eq!(refresher.sweep(5, &mut out), Ok(1));
-    assert_eq!(out[0], Some(2));
-    assert!(!refresher.is_empty());
 }
 
 #[test]
@@ -353,12 +332,12 @@ fn waiters_can_cancel_before_and_after_the_refresh_settles() {
     let early = wait(&mut refresher, 1, 0);
     let late = wait(&mut refresher, 1, 0);
     assert_eq!(refresher.cancel(early), Ok(()));
-    assert_eq!(refresher.cancel(early), Err(Refused::Stale));
+    assert_eq!(refresher.cancel(early), Err(Refusal::Stale));
     assert_eq!(refresher.abandon(lease), Ok(()));
     assert_eq!(refresher.pending(), 1);
     assert_eq!(refresher.cancel(late), Ok(()));
     assert_eq!(refresher.poll(), None);
-    assert_eq!(refresher.cancel(WaiterId::from_raw(0)), Err(Refused::Stale));
+    assert_eq!(refresher.cancel(WaiterId::from_raw(0)), Err(Refusal::Stale));
 }
 
 #[test]
@@ -405,17 +384,17 @@ fn exhausted_lease_ids_refuse_without_mutating() {
     };
     refresher.leases = MAX;
     let before = refresher.clone();
-    assert_eq!(refresher.decide(3, 20, 100), Err(Refused::Exhausted));
-    assert_eq!(refresher.decide(2, 20, 100), Err(Refused::Exhausted));
+    assert_eq!(refresher.decide(3, 20, 100), Err(Refusal::Exhausted));
+    assert_eq!(refresher.decide(2, 20, 100), Err(Refusal::Exhausted));
     assert_eq!(refresher, before);
     assert_eq!(
         revalidation(refresher.decide(1, 12, 100)),
-        (12, Revalidation::Unavailable(Refused::Exhausted))
+        (12, Revalidation::Unavailable(Refusal::Exhausted))
     );
     assert_eq!(refresher.leading(2), Some(overdue));
     assert_eq!(
         refresher.store(Lease::from_raw(MAX), 12, 0, RULES),
-        Err(Refused::Stale)
+        Err(Refusal::Stale)
     );
     assert_eq!(Lease::from_raw(overdue.raw()), overdue);
 }
@@ -423,8 +402,8 @@ fn exhausted_lease_ids_refuse_without_mutating() {
 #[test]
 fn zero_capacity_refuses_everything() {
     let mut refresher = Refresher::<0, 0, 0>::default();
-    assert_eq!(refresher.decide(1, 0, 1), Err(Refused::FlightsFull));
-    assert_eq!(refresher.put(1, 0, 0, RULES), Err(Refused::EntriesFull));
+    assert_eq!(refresher.decide(1, 0, 1), Err(Refusal::FlightsFull));
+    assert_eq!(refresher.put(1, 0, 0, RULES), Err(Refusal::EntriesFull));
     assert_eq!(
         (
             refresher.capacity(),
@@ -436,7 +415,7 @@ fn zero_capacity_refuses_everything() {
     let roomy = Small::new();
     assert_eq!((roomy.flight_capacity(), roomy.waiter_capacity()), (2, 3));
     assert_eq!(
-        std::format!("{}", Refused::Rejected),
+        std::format!("{}", Refusal::Rejected),
         "lead duration must be positive"
     );
 }

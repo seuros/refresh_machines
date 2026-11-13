@@ -1,63 +1,18 @@
 #![no_std]
 #![doc = include_str!("../README.md")]
 
-use core::fmt;
-
 use coalesce_machines::{Coalescer, Joined, SEQUENCE_MAX, scoped};
 pub use coalesce_machines::{FlightId, Notification, Outcome, WaiterId};
 
 mod lease;
 mod policy;
+mod refusal;
 
 pub use lease::Lease;
 pub use policy::{Policy, State};
-
-/// Why a call changed nothing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum Refused {
-    /// `now` is earlier than a time this refresher already accepted.
-    TimeRegressed,
-    /// A zero lead duration: the lease would be overdue before it was issued.
-    Rejected,
-    /// Every metadata slot holds another key.
-    EntriesFull,
-    /// Every refresh slot holds an unsettled refresh; no new key can be led.
-    FlightsFull,
-    /// Every waiter slot holds a waiting caller or an undrained notification.
-    WaitersFull,
-    /// The id space is spent; this refresher can register nothing more.
-    Exhausted,
-    /// The lease or waiter names nothing live.
-    Stale,
-}
-
-impl fmt::Display for Refused {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::TimeRegressed => "time moved backwards",
-            Self::Rejected => "lead duration must be positive",
-            Self::EntriesFull => "every metadata slot is in use",
-            Self::FlightsFull => "every refresh slot is in use",
-            Self::WaitersFull => "every waiter slot is in use",
-            Self::Exhausted => "id space exhausted",
-            Self::Stale => "id does not name a live lease or waiter",
-        })
-    }
-}
-
-impl core::error::Error for Refused {}
-
-impl From<coalesce_machines::Refused> for Refused {
-    fn from(refused: coalesce_machines::Refused) -> Self {
-        match refused {
-            coalesce_machines::Refused::FlightsFull => Self::FlightsFull,
-            coalesce_machines::Refused::WaitersFull => Self::WaitersFull,
-            coalesce_machines::Refused::Exhausted => Self::Exhausted,
-            _ => Self::Stale,
-        }
-    }
-}
+pub use refusal::Refusal;
+#[allow(deprecated)]
+pub use refusal::Refused;
 
 /// What is happening about refreshing a stale value that is being served.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,7 +29,7 @@ pub enum Revalidation {
     },
     /// A refresh is due but could not be registered. Just serve; the next
     /// caller tries again.
-    Unavailable(Refused),
+    Unavailable(Refusal),
 }
 
 /// The answer to "may I serve what I have for this key?".
@@ -169,7 +124,7 @@ impl<const KEYS: usize, const FLIGHTS: usize, const WAITERS: usize>
     /// scope issue the same ones, and an id handed to the wrong refresher can
     /// name a live lease or waiter there. Give each refresher, and each
     /// coalescer whose ids could meet it, its own scope: an id from another
-    /// scope is then always [`Refused::Stale`]. Keeping scopes distinct is
+    /// scope is then always [`Refusal::Stale`]. Keeping scopes distinct is
     /// the caller's job.
     #[must_use]
     pub const fn with_scope(scope: u16) -> Self {
@@ -196,14 +151,14 @@ impl<const KEYS: usize, const FLIGHTS: usize, const WAITERS: usize>
     ///
     /// # Errors
     ///
-    /// [`Refused::TimeRegressed`], [`Refused::Rejected`] for a zero
+    /// [`Refusal::TimeRegressed`], [`Refusal::Rejected`] for a zero
     /// `lead_for`, and, only when nothing is servable,
-    /// [`Refused::FlightsFull`], [`Refused::WaitersFull`] or
-    /// [`Refused::Exhausted`]. Nothing changes.
-    pub fn decide(&mut self, key: u64, now: u64, lead_for: u64) -> Result<Decision, Refused> {
+    /// [`Refusal::FlightsFull`], [`Refusal::WaitersFull`] or
+    /// [`Refusal::Exhausted`]. Nothing changes.
+    pub fn decide(&mut self, key: u64, now: u64, lead_for: u64) -> Result<Decision, Refusal> {
         self.check(now)?;
         if lead_for == 0 {
-            return Err(Refused::Rejected);
+            return Err(Refusal::Rejected);
         }
         let live = self
             .lead_slot(key)
@@ -247,8 +202,8 @@ impl<const KEYS: usize, const FLIGHTS: usize, const WAITERS: usize>
     ///
     /// # Errors
     ///
-    /// [`Refused::TimeRegressed`], [`Refused::Stale`] when the lease is not
-    /// live, [`Refused::EntriesFull`] when the key is new and no metadata slot
+    /// [`Refusal::TimeRegressed`], [`Refusal::Stale`] when the lease is not
+    /// live, [`Refusal::EntriesFull`] when the key is new and no metadata slot
     /// is free (the lease stays live: [`Self::forget`] a key and retry, or
     /// [`Self::abandon`]). Nothing changes.
     pub fn store(
@@ -257,10 +212,10 @@ impl<const KEYS: usize, const FLIGHTS: usize, const WAITERS: usize>
         now: u64,
         age: u64,
         policy: Policy,
-    ) -> Result<(), Refused> {
+    ) -> Result<(), Refusal> {
         self.check(now)?;
-        let (slot, lead) = self.held(lease).ok_or(Refused::Stale)?;
-        let home = self.room_for(lead.key).ok_or(Refused::EntriesFull)?;
+        let (slot, lead) = self.held(lease).ok_or(Refusal::Stale)?;
+        let home = self.room_for(lead.key).ok_or(Refusal::EntriesFull)?;
         self.flights.complete(lead.flight)?;
         self.leads[slot] = None;
         self.entries[home] = Some(Entry {
@@ -283,16 +238,16 @@ impl<const KEYS: usize, const FLIGHTS: usize, const WAITERS: usize>
     ///
     /// # Errors
     ///
-    /// [`Refused::TimeRegressed`], or [`Refused::Stale`] when the lease is not
+    /// [`Refusal::TimeRegressed`], or [`Refusal::Stale`] when the lease is not
     /// live. Nothing changes.
     pub fn fail(
         &mut self,
         lease: Lease,
         now: u64,
         retry_after: u64,
-    ) -> Result<Option<u64>, Refused> {
+    ) -> Result<Option<u64>, Refusal> {
         self.check(now)?;
-        let (slot, lead) = self.held(lease).ok_or(Refused::Stale)?;
+        let (slot, lead) = self.held(lease).ok_or(Refusal::Stale)?;
         self.flights.abandon(lead.flight)?;
         self.leads[slot] = None;
         self.now = now;
@@ -314,9 +269,9 @@ impl<const KEYS: usize, const FLIGHTS: usize, const WAITERS: usize>
     ///
     /// # Errors
     ///
-    /// [`Refused::Stale`] when the lease is not live. Nothing changes.
-    pub fn abandon(&mut self, lease: Lease) -> Result<(), Refused> {
-        let (slot, lead) = self.held(lease).ok_or(Refused::Stale)?;
+    /// [`Refusal::Stale`] when the lease is not live. Nothing changes.
+    pub fn abandon(&mut self, lease: Lease) -> Result<(), Refusal> {
+        let (slot, lead) = self.held(lease).ok_or(Refusal::Stale)?;
         self.flights.abandon(lead.flight)?;
         self.leads[slot] = None;
         Ok(())
@@ -330,8 +285,8 @@ impl<const KEYS: usize, const FLIGHTS: usize, const WAITERS: usize>
     ///
     /// # Errors
     ///
-    /// [`Refused::TimeRegressed`]. Nothing changes.
-    pub fn reap(&mut self, now: u64) -> Result<usize, Refused> {
+    /// [`Refusal::TimeRegressed`]. Nothing changes.
+    pub fn reap(&mut self, now: u64) -> Result<usize, Refusal> {
         self.check(now)?;
         self.now = now;
         let mut revoked = 0;
@@ -351,11 +306,11 @@ impl<const KEYS: usize, const FLIGHTS: usize, const WAITERS: usize>
     ///
     /// # Errors
     ///
-    /// [`Refused::TimeRegressed`], or [`Refused::EntriesFull`] when the key is
+    /// [`Refusal::TimeRegressed`], or [`Refusal::EntriesFull`] when the key is
     /// new and no metadata slot is free. Nothing changes.
-    pub fn put(&mut self, key: u64, now: u64, age: u64, policy: Policy) -> Result<(), Refused> {
+    pub fn put(&mut self, key: u64, now: u64, age: u64, policy: Policy) -> Result<(), Refusal> {
         self.check(now)?;
-        let home = self.room_for(key).ok_or(Refused::EntriesFull)?;
+        let home = self.room_for(key).ok_or(Refusal::EntriesFull)?;
         self.entries[home] = Some(Entry {
             key,
             stored_at: now,
@@ -377,14 +332,16 @@ impl<const KEYS: usize, const FLIGHTS: usize, const WAITERS: usize>
 
     /// Drop metadata that is [`State::Expired`] at `now`, writing the keys to `out`.
     ///
-    /// Writes `Some` into the first `n` entries, returns `n`, and stops when
-    /// `out` is full: call again to continue. Keys with a refresh in flight
-    /// are kept. The values themselves are the caller's to delete.
+    /// Writes the first `n` entries, returns `n`, leaves the rest untouched,
+    /// and stops when `out` is full: call again to continue. Only those `n`
+    /// are swept keys; `[0; N]` sizes the buffer, and zero is also a valid
+    /// key, so read no further than `n`. Keys with a refresh in flight are
+    /// kept. The values themselves are the caller's to delete.
     ///
     /// # Errors
     ///
-    /// [`Refused::TimeRegressed`]. Nothing changes.
-    pub fn sweep(&mut self, now: u64, out: &mut [Option<u64>]) -> Result<usize, Refused> {
+    /// [`Refusal::TimeRegressed`]. Nothing changes.
+    pub fn sweep(&mut self, now: u64, out: &mut [u64]) -> Result<usize, Refusal> {
         self.check(now)?;
         self.now = now;
         let mut written = 0;
@@ -399,7 +356,7 @@ impl<const KEYS: usize, const FLIGHTS: usize, const WAITERS: usize>
                 && self.lead_slot(entry.key).is_none()
             {
                 self.entries[slot] = None;
-                out[written] = Some(entry.key);
+                out[written] = entry.key;
                 written += 1;
             }
         }
@@ -410,8 +367,8 @@ impl<const KEYS: usize, const FLIGHTS: usize, const WAITERS: usize>
     ///
     /// # Errors
     ///
-    /// [`Refused::Stale`] when `waiter` is not registered. Nothing changes.
-    pub fn cancel(&mut self, waiter: WaiterId) -> Result<(), Refused> {
+    /// [`Refusal::Stale`] when `waiter` is not registered. Nothing changes.
+    pub fn cancel(&mut self, waiter: WaiterId) -> Result<(), Refusal> {
         Ok(self.flights.cancel(waiter)?)
     }
 
@@ -422,8 +379,11 @@ impl<const KEYS: usize, const FLIGHTS: usize, const WAITERS: usize>
 
     /// Move queued notifications into `out`, oldest first, and return how many.
     ///
-    /// Resumable: whatever did not fit stays queued, in order.
-    pub fn drain(&mut self, out: &mut [Option<Notification>]) -> usize {
+    /// Writes the first `n` entries and leaves the rest untouched; only those
+    /// `n` are notifications. `[Notification::default(); N]` sizes the buffer
+    /// with a placeholder the refresher never emits. Resumable: whatever did
+    /// not fit stays queued, in order.
+    pub fn drain(&mut self, out: &mut [Notification]) -> usize {
         self.flights.drain(out)
     }
 
@@ -452,6 +412,22 @@ impl<const KEYS: usize, const FLIGHTS: usize, const WAITERS: usize>
     #[must_use]
     pub fn leading(&self, key: u64) -> Option<Lease> {
         Some(Lease(self.leads[self.lead_slot(key)?]?.lease))
+    }
+
+    /// The coalesce flight a live lease rides on.
+    ///
+    /// This is the [`Notification::flight`] the waiters of that refresh will
+    /// be woken with, so a drained notification can be tied back to a lease.
+    /// A takeover issues a new lease for the same flight: the new lease
+    /// answers the flight the old one did, and the old one answers `None`.
+    /// Once the refresh settles the lease is stale, so record the pairing
+    /// while the lease is live if it is needed after the report.
+    ///
+    /// `None` for a lease that is not live: never issued, reported, abandoned,
+    /// reaped, taken over, or issued in another scope.
+    #[must_use]
+    pub fn flight(&self, lease: Lease) -> Option<FlightId> {
+        Some(self.held(lease)?.1.flight)
     }
 
     /// The latest time this refresher accepted.
@@ -508,9 +484,9 @@ impl<const KEYS: usize, const FLIGHTS: usize, const WAITERS: usize>
         WAITERS
     }
 
-    const fn check(&self, now: u64) -> Result<(), Refused> {
+    const fn check(&self, now: u64) -> Result<(), Refusal> {
         if now < self.now {
-            Err(Refused::TimeRegressed)
+            Err(Refusal::TimeRegressed)
         } else {
             Ok(())
         }
@@ -542,10 +518,10 @@ impl<const KEYS: usize, const FLIGHTS: usize, const WAITERS: usize>
     }
 
     /// Issue a lease for `key`: a new refresh, or a takeover of an overdue one.
-    fn lead(&mut self, key: u64, now: u64, lead_for: u64) -> Result<Lease, Refused> {
+    fn lead(&mut self, key: u64, now: u64, lead_for: u64) -> Result<Lease, Refusal> {
         let sequence = self.leases.saturating_add(1);
         if sequence > SEQUENCE_MAX {
-            return Err(Refused::Exhausted);
+            return Err(Refusal::Exhausted);
         }
         let lease = scoped(self.scope(), sequence);
         let deadline = now.saturating_add(lead_for);
@@ -560,13 +536,13 @@ impl<const KEYS: usize, const FLIGHTS: usize, const WAITERS: usize>
                 .leads
                 .iter()
                 .position(Option::is_none)
-                .ok_or(Refused::FlightsFull)?;
+                .ok_or(Refusal::FlightsFull)?;
             let flight = match self.flights.join(key)? {
                 Joined::Leader(flight) => flight,
                 // Unreachable while every flight has a lead; undo and refuse.
                 Joined::Follower { waiter, .. } => {
                     self.flights.cancel(waiter)?;
-                    return Err(Refused::Stale);
+                    return Err(Refusal::Stale);
                 }
             };
             self.leads[slot] = Some(Lead {
@@ -580,13 +556,13 @@ impl<const KEYS: usize, const FLIGHTS: usize, const WAITERS: usize>
         Ok(Lease(lease))
     }
 
-    fn follow(&mut self, key: u64) -> Result<WaiterId, Refused> {
+    fn follow(&mut self, key: u64) -> Result<WaiterId, Refusal> {
         match self.flights.join(key)? {
             Joined::Follower { waiter, .. } => Ok(waiter),
             // Unreachable while every lead has a flight; undo and refuse.
             Joined::Leader(flight) => {
                 self.flights.abandon(flight)?;
-                Err(Refused::Stale)
+                Err(Refusal::Stale)
             }
         }
     }

@@ -31,13 +31,16 @@ class RefresherTest < Minitest::Test
     refute_equal a.waiter_id, b.waiter_id
     assert_equal [1, 2, 0, 0], [@refresher.in_flight, @refresher.waiting, @refresher.pending, @refresher.size]
     assert_empty @refresher.drain(10)
+    flight = @refresher.flight(fetch.lease_id)
+    assert_kind_of Integer, flight
 
     assert_equal :stored, @refresher.store(fetch.lease_id, 3, 0, RULES)
     assert_equal :stale, @refresher.store(fetch.lease_id, 3, 0, RULES)
     assert_equal [0, 0, 2, 1], [@refresher.in_flight, @refresher.waiting, @refresher.pending, @refresher.size]
     assert_nil @refresher.leading(42)
-    assert_equal [R::Notification.new(a.waiter_id, 42, :completed)], @refresher.drain(1)
-    assert_equal [R::Notification.new(b.waiter_id, 42, :completed)], @refresher.drain(10)
+    assert_nil @refresher.flight(fetch.lease_id)
+    assert_equal [R::Notification.new(a.waiter_id, flight, 42, :completed)], @refresher.drain(1)
+    assert_equal [R::Notification.new(b.waiter_id, flight, 42, :completed)], @refresher.drain(10)
     assert_equal R::Fresh.new(1), @refresher.decide(42, 4, 100)
     assert_equal 4, @refresher.now
   end
@@ -64,8 +67,9 @@ class RefresherTest < Minitest::Test
     fetch = @refresher.decide(7, 15, 100)
     assert_instance_of R::Fetch, fetch
     waiter = @refresher.decide(7, 16, 100)
+    flight = @refresher.flight(fetch.lease_id)
     assert_equal 17, @refresher.fail(fetch.lease_id, 17, 5)
-    assert_equal [R::Notification.new(waiter.waiter_id, 7, :abandoned)], @refresher.drain(10)
+    assert_equal [R::Notification.new(waiter.waiter_id, flight, 7, :abandoned)], @refresher.drain(10)
     assert_equal R::Stale.new(21, :backoff, nil, 22), @refresher.decide(7, 21, 100)
     assert_equal 0, @refresher.in_flight
 
@@ -93,12 +97,56 @@ class RefresherTest < Minitest::Test
     refute_equal dead.lease_id, heir.lease_id
     assert_equal :stale, @refresher.store(dead.lease_id, 11, 0, RULES)
     assert_equal [1, 1], [@refresher.in_flight, @refresher.waiting]
+    flight = @refresher.flight(heir.lease_id)
 
     assert_equal 0, @refresher.reap(19)
     assert_equal 1, @refresher.reap(20)
     assert_equal :time_regressed, @refresher.reap(19)
     assert_equal :stale, @refresher.store(heir.lease_id, 20, 0, RULES)
-    assert_equal [R::Notification.new(waiter.waiter_id, 5, :abandoned)], @refresher.drain(10)
+    assert_equal [R::Notification.new(waiter.waiter_id, flight, 5, :abandoned)], @refresher.drain(10)
+  end
+
+  def test_notification_has_the_fields_of_a_coalescer_notification
+    assert_equal %i[waiter_id flight_id key outcome], R::Notification.members
+    note = R::Notification.new(waiter_id: 2, flight_id: 1, key: 42, outcome: :completed)
+    assert_equal [2, 1, 42, :completed], note.to_h.values
+  end
+
+  def test_flight_ties_a_notification_back_to_its_lease
+    fetch = @refresher.decide(42, 0, 10)
+    other = @refresher.decide(43, 0, 10)
+    flight = @refresher.flight(fetch.lease_id)
+    refute_equal flight, @refresher.flight(other.lease_id)
+    waiter = @refresher.decide(42, 9, 10)
+
+    # A takeover issues a new lease for the same flight.
+    heir = @refresher.decide(42, 10, 10)
+    assert_nil @refresher.flight(fetch.lease_id)
+    assert_equal flight, @refresher.flight(heir.lease_id)
+
+    assert_equal :stored, @refresher.store(heir.lease_id, 11, 0, RULES)
+    note = @refresher.drain(10).first
+    assert_equal [waiter.waiter_id, flight, 42, :completed], note.to_h.values
+    assert_nil @refresher.flight(heir.lease_id)
+    assert_kind_of Integer, @refresher.flight(other.lease_id)
+  end
+
+  def test_flight_of_a_stale_or_foreign_lease_is_nil
+    near = R::Refresher.new(scope: 1)
+    far = R::Refresher.new(scope: 2)
+    near_fetch = near.decide(7, 0, 100)
+    far_fetch = far.decide(7, 0, 100)
+    assert_equal 1, near.flight(near_fetch.lease_id) >> 48
+    assert_nil near.flight(far_fetch.lease_id)
+    assert_nil far.flight(near_fetch.lease_id)
+    assert_nil @refresher.flight(0)
+    assert_nil @refresher.flight(MAX)
+    assert_equal :abandoned, near.abandon(near_fetch.lease_id)
+    assert_nil near.flight(near_fetch.lease_id)
+    assert_raises(TypeError) { @refresher.flight(nil) }
+    assert_raises(TypeError) { @refresher.flight(1.0) }
+    assert_raises(RangeError) { @refresher.flight(-1) }
+    assert_raises(RangeError) { @refresher.flight(2**64) }
   end
 
   def test_scopes_keep_the_ids_of_separate_refreshers_apart
@@ -221,5 +269,6 @@ class RefresherTest < Minitest::Test
     assert_raises(FrozenError) { @refresher.cancel(1) }
     assert_raises(FrozenError) { @refresher.drain(1) }
     assert_equal :fresh, @refresher.state(1, 0)
+    assert_nil @refresher.flight(1)
   end
 end

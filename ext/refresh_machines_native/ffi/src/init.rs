@@ -34,6 +34,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     class.define_method("state", method!(Refresher::state, 2))?;
     class.define_method("stale_if_error", method!(Refresher::stale_if_error, 2))?;
     class.define_method("leading", method!(Refresher::leading, 1))?;
+    class.define_method("flight", method!(Refresher::flight, 1))?;
     class.define_method("now", method!(Refresher::now, 0))?;
     class.define_method("size", method!(Refresher::size, 0))?;
     class.define_method("in_flight", method!(Refresher::in_flight, 0))?;
