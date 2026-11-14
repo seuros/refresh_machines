@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.6.0](https://github.com/seuros/refresh_machines/compare/refresh_machines/v0.5.0...refresh_machines/v0.6.0) (2026-11-14)
+
+
+### ⚠ BREAKING CHANGES
+
+* adopt matryona-machines 0.2: hooks name their field, instant for answered ages, symbols! tables, exact Policy fields
+
+### Features
+
+* adopt matryona-machines 0.2: hooks name their field, instant for answered ages, symbols! tables, exact Policy fields ([c0d3932](https://github.com/seuros/refresh_machines/commit/c0d393265f5f0b0306cc82a8ea31f125346cc776))
+
 ## [0.5.0](https://github.com/seuros/refresh_machines/compare/refresh_machines/v0.4.0...refresh_machines/v0.5.0) (2026-11-14)
 
 
