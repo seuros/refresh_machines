@@ -15,7 +15,9 @@ gem 'refresh_machines'
 ```ruby
 S = 1_000_000_000 # every instant and span is Integer nanoseconds
 RULES = RefreshMachines::Policy.new(60 * S, 30 * S, 300 * S) # fresh 60s, +30s while revalidating, +300s on error
-refresher = RefreshMachines::Refresher.new
+# Its own scope: two `Refresher.new` both count ids in scope zero, so their
+# leases and waiter ids alias, and one handed to the other names a live lease there.
+refresher = RefreshMachines::Refresher.with_scope(1)
 
 def read(refresher, cache, key)
   now = Process.clock_gettime(Process::CLOCK_MONOTONIC, :nanosecond)
@@ -195,7 +197,7 @@ A `Stale` has two fields, `age` and `revalidation`, and `revalidation` is one of
 | `Lead(lease)` | Nobody was refreshing this key. You are now: report with `lease`. |
 | `:in_flight` | Another caller holds a live lease. Just serve. |
 | `Backoff(until)` | The last refresh failed and asked for quiet until that instant. Just serve. |
-| `Unavailable(refusal)` | A refresh is due but could not be registered; `refusal` is `:flights_full` or `:exhausted`. Just serve. |
+| `Unavailable(refusal)` | A refresh is due but could not be registered; `decide` answers it with `refusal` `:flights_full` or `:exhausted`. Just serve. |
 
 ### Fail, and stale if error
 
@@ -264,7 +266,7 @@ refresher.forget(43)                         # => :not_held, nothing to drop, no
 refresher.sweep(t0 + (1_000 * S), 50)        # => [42]
 ```
 
-`forget` is for when your cache evicts a value. It never refuses: forgetting a key that has no metadata is the same request already satisfied, so it answers `:not_held`. `size` counts the keys with metadata and `empty?` says whether there are none. `sweep(now, max)` drops up to `max` expired entries and returns their keys so you can delete the values too. Call it again for the rest.
+`forget` is for when your cache evicts a value. It never refuses: forgetting a key that has no metadata is the same request already satisfied, so it answers `:not_held`. `size` counts the keys with metadata and `empty?` says whether there are none. `sweep(now, max)` drops up to `max` expired entries and returns their keys so you can delete the values too. Call it again for the rest. A `max` past `CAPACITY` (for `drain`, past `WAITER_CAPACITY`) simply takes everything there is, since there is never more.
 
 ### Capacity
 
@@ -282,33 +284,36 @@ Past those, `put` and `store` say `:entries_full`, and `decide` says `:flights_f
 refresher = RefreshMachines::Refresher.new
 refresher.put(1, t0, 0, rules)         # => :stored
 refresher.decide(1, t0 - 1, 100 * S)   # => :time_regressed
-refresher.decide(1, t0, 0)             # => :rejected, a zero lease is overdue at birth
+refresher.decide(1, t0, 0)             # => :zero_lead, a zero lease is overdue at birth
 ```
 
 ## The Rules of the Quartermaster
 
-- **Everything is an Integer** in `0..2**64-1`. Floats, nil and strings raise `TypeError`. Out of range raises `RangeError`. A policy argument that isn't a `Policy` raises `TypeError`.
+- **Everything is an Integer** in `0..2**64-1`. Floats, nil and strings raise `TypeError`. Out of range raises `RangeError`. A policy argument that isn't a `Policy` raises `TypeError`. An id the refresher could never have issued, one whose sequence (the low 48 bits) is zero, raises `RangeError` wherever a lease or waiter id is taken (`store`, `fail`, `abandon`, `cancel`, `flight`), before the refresher is asked.
+- **Values are valid or do not exist.** Every Data value checks itself through the core when it is built, by the gem or by hand: `Policy` windows in `0..2**64-1`; `Fresh#age`, `Stale#age` and `Backoff#until` Integer nanoseconds up to the core's `Duration::MAX`; a `Stale#revalidation` that is a `Lead`, `:in_flight`, a `Backoff` or an `Unavailable`; lease, waiter and flight ids with a nonzero sequence; a `Wait` or `Notification` whose waiter is of its flight's scope and issued after it; an `Unavailable#refusal` that is a refusal symbol; an `outcome` of `:completed` or `:abandoned`. The wrong type raises `TypeError`, a value outside that `RangeError`: `Fetch.new(0)`, `Wait.new(2, 3)` and `Unavailable.new(:nope)` raise.
+- **The binding never loses work.** Every argument is converted before the core is called, and every class was resolved once, when the extension loaded. A mutating call whose answer is a Ruby object (`decide`, `sweep`, `poll`, `drain`) decides on a copy of the refresher and keeps it only once the answer is built, natively (allocate, fill, freeze, no Ruby `initialize`); `drain` and `sweep` read into a buffer first. Frozen meanwhile is `FrozenError`, changed meanwhile `RuntimeError`; a call that raises changed nothing.
+- **Values are sealed, and the binding is the authority.** Subclassing a value class raises `TypeError` and `allocate` is undefined. Sealing stops accidents, not reflection (a named subclass's constant is bound before the raise, `Marshal.load` skips `initialize`), so a value the binding reads (a `Policy`, a `Stale`'s revalidation) must be an instance of exactly its class, and its fields are checked again: a forged one raises `TypeError` or `RangeError`.
 - **Time is Integer nanoseconds.** Instants (`now`, `Backoff#until`) and spans (ages, the three policy windows, `lead_for`, `retry_after`) alike, in and out. A Float, a Rational or anything else that isn't an Integer raises `TypeError`; a negative one or one past `2**64-1` raises `RangeError`. Nothing wraps: a returned age or `Backoff#until` is the exact sum, even when that is larger than any argument you could pass back in.
-- **Refusals don't raise.** `:time_regressed`, `:rejected`, `:entries_full`, `:flights_full`, `:waiters_full`, `:exhausted` and `:stale` are answers, and a refused call changes nothing.
+- **Refusals don't raise.** `:time_regressed`, `:zero_lead`, `:entries_full`, `:flights_full`, `:waiters_full`, `:exhausted` and `:stale` are answers, and a refused call changes nothing.
 - **Every answer, by method.**
 
-  | Method | Honoured | Refused |
-  | --- | --- | --- |
-  | `decide(key, now, lead_for)` | a `Fresh`, `Stale`, `Fetch` or `Wait` | `:time_regressed`, `:rejected`, and, only when nothing is servable, `:flights_full`, `:waiters_full`, `:exhausted` |
-  | `store(lease, now, age, policy)` | `:stored` | `:time_regressed`, `:stale`, `:entries_full` |
-  | `fail(lease, now, retry_after)` | the age of the value that covers for the failure (Integer), or `nil` when nothing does | `:time_regressed`, `:stale` |
-  | `abandon(lease)` | `:abandoned` | `:stale` |
-  | `reap(now)` | leases revoked (Integer) | `:time_regressed` |
-  | `put(key, now, age, policy)` | `:stored` | `:time_regressed`, `:entries_full` |
-  | `forget(key)` | `:forgotten` when there was metadata to drop, `:not_held` when there was none (an idempotent repeat) | never refuses |
-  | `sweep(now, max)` | an Array of swept keys | `:time_regressed` |
-  | `cancel(waiter)` | `:cancelled` | `:stale` |
-  | `poll` | the oldest queued `Notification`, `nil` when nothing is queued | never refuses |
-  | `drain(max)` | an Array of `Notification`, `[]` when nothing is queued | never refuses |
+  | Method | Honoured | Refused | Records `now` |
+  | --- | --- | --- | --- |
+  | `decide(key, now, lead_for)` | a `Fresh`, `Stale`, `Fetch` or `Wait` | `:time_regressed`, `:zero_lead`, and, only when nothing is servable, `:flights_full`, `:waiters_full`, `:exhausted` | every honoured answer, `Stale` with an `Unavailable` included: each depends on the age and the lease deadline at `now` |
+  | `store(lease, now, age, policy)` | `:stored` | `:time_regressed`, `:stale`, `:entries_full` | yes: the stored value's age counts from `now` |
+  | `fail(lease, now, retry_after)` | the age of the value that covers for the failure (Integer), or `nil` when nothing does | `:time_regressed`, `:stale` | yes, both answers: the age, the window and the backoff are judged at `now` |
+  | `abandon(lease)` | `:abandoned` | `:stale` | takes no time |
+  | `reap(now)` | leases revoked (Integer) | `:time_regressed` | yes, `0` included: which leases are overdue depends on `now` |
+  | `put(key, now, age, policy)` | `:stored` | `:time_regressed`, `:entries_full` | yes: the value's age counts from `now` |
+  | `forget(key)` | `:forgotten` when there was metadata to drop, `:not_held` when there was none (an idempotent repeat) | never refuses | takes no time |
+  | `sweep(now, max)` | an Array of swept keys | `:time_regressed` | yes, `[]` included: which entries are expired depends on `now` |
+  | `cancel(waiter)` | `:cancelled` | `:stale` | takes no time |
+  | `poll` | the oldest queued `Notification`, `nil` when nothing is queued | never refuses | takes no time |
+  | `drain(max)` | an Array of `Notification`, `[]` when nothing is queued | never refuses | takes no time |
 
-  Every refusal has its own symbol; there is no catch-all.
+  Every refusal has its own symbol; there is no catch-all. A refusal records no time: regression is judged against the latest honoured `now`, which `now` reads back.
 - **A lease is a capability.** Whoever holds the lease id reports the refresh. Reported, abandoned, reaped or taken over, it answers `:stale` forever.
-- **Scopes: ids belong to the refresher that issued them.** Lease, waiter and flight ids are plain Integers, so two refreshers in the same scope issue the same ones, and an id handed to the wrong refresher can name a live lease or waiter there. If you run more than one, or a `CoalesceMachines::Coalescer` beside it, give each its own scope: `Refresher.with_scope(3)`, any Integer in `0..65_535`. `Refresher.new` is scope zero and counts 1, 2, 3 across leases, flights and waiters alike. The scope rides in the top 16 bits of every id, above a 48-bit sequence, and an id from another scope is always `:stale` (`nil` from `flight`). The refresher can't pick a scope for you. `RefreshMachines.scope_of(id)` reads the scope back, so you can route an id to the refresher that issued it. It is the only layout helper the gem has: the layout belongs to the Rust crate `periscope-machines`, which has no gem. A scope that isn't an Integer raises `TypeError`; out of range raises `RangeError`.
+- **Scopes: ids belong to the refresher that issued them.** Lease, waiter and flight ids are plain Integers, so two refreshers in the same scope issue the same ones, and an id handed to the wrong refresher can name a live lease or waiter there. Two `Refresher.new` are both scope zero, so their ids alias. If you run more than one, or a `CoalesceMachines::Coalescer` beside it, give each its own scope: `Refresher.with_scope(3)`, any Integer in `0..65_535`. `Refresher.new` is scope zero and counts 1, 2, 3 across leases, flights and waiters alike. The scope rides in the top 16 bits of every id, above a 48-bit sequence, and an id from another scope is always `:stale` (`nil` from `flight`). The refresher can't pick a scope for you. `RefreshMachines.scope_of(id)` reads the scope back, so you can route an id to the refresher that issued it. It is the only layout helper the gem has: the layout belongs to the Rust crate `periscope-machines`, which has no gem. A scope that isn't an Integer raises `TypeError`; out of range raises `RangeError`.
 - **One sequence: a lease number is never a waiter number.** Leases, waiter ids and flight ids are bare Integers, so nothing but their values tells them apart, and the refresher draws all three from one sequence: no two ids it issues are equal. Pass a lease to `cancel`, or a waiter or flight id to `store`, `fail`, `abandon` or `flight`, and you get `:stale` (`nil` from `flight`) with nothing changed. A new refresh takes two numbers, its lease and then its flight; a takeover and a wait take one. After `2**48 - 1` of them `decide` answers `:exhausted` wherever it would need an id, and a full table is reported first: `:flights_full` or `:waiters_full` before `:exhausted`.
 - **Restarts: resume the sequence, or take a new scope.** A new refresher counts from one again, so a lease or waiter id that outlived a restart could name a new refresh. Either save `issued` and build the replacement with `Refresher.resumed(scope, issued)`, which is empty, at time zero, and carries on after the saved count (`nil` if `issued` is more than `2**48 - 1`), or give each incarnation a scope it never had before.
 - **Repeats are refused.** A second `store`, `fail`, or `abandon` on a settled lease, and a second `cancel` on a waiter that left, are `:stale`: the refresher keeps nothing about how a lease or waiter ended.

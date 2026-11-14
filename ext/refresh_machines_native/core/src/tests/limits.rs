@@ -1,8 +1,9 @@
 //! The ends of time, of the id space and of zero-sized tables.
 use periscope_machines::SEQUENCE_MAX;
 
-use super::{MAX, NEAR, RULES, Small, fetch, near_the_end, revalidation, std, t};
+use super::{MAX, NEAR, RULES, Small, fetch, lease_of, near_the_end, revalidation, std, t};
 use crate::*;
+use core::assert_matches;
 
 #[test]
 fn duration_limits_saturate_instead_of_wrapping() {
@@ -20,10 +21,7 @@ fn duration_limits_saturate_instead_of_wrapping() {
     let Ok(Decision::Fetch { lease }) = refresher.decide(2, t(10), MAX) else {
         panic!("leads");
     };
-    assert!(matches!(
-        refresher.decide(2, NEAR, t(1)),
-        Ok(Decision::Wait { .. })
-    ));
+    assert_matches!(refresher.decide(2, NEAR, t(1)), Ok(Decision::Wait { .. }));
     assert_eq!(
         refresher.store(lease, NEAR, t(0), Policy::new(t(1), MAX, MAX)),
         Ok(())
@@ -36,10 +34,10 @@ fn duration_limits_saturate_instead_of_wrapping() {
     // A backoff past the end of time saturates too.
     assert_eq!(refresher.fail(lease, MAX, MAX), Ok(Some(t(1))));
     assert_eq!(refresher.now(), MAX);
-    assert!(matches!(
+    assert_matches!(
         revalidation(refresher.decide(2, MAX, t(1))),
         (age, Revalidation::Lead(_)) if age == t(1)
-    ));
+    );
 }
 
 #[test]
@@ -62,11 +60,16 @@ fn a_spent_id_space_refuses_without_mutating() {
         revalidation(refresher.decide(1, t(12), t(100))),
         (t(12), Revalidation::Unavailable(Refusal::Exhausted))
     );
+    // Honoured, so it records the clock it depended on, and only the clock.
+    let mut advanced = before;
+    assert_eq!(advanced.put(9, t(12), t(0), RULES), Ok(()));
+    assert_eq!(advanced.forget(9), Forgetting::Forgotten);
+    assert_eq!(refresher, advanced);
     assert_eq!(refresher.leading(2), Some(overdue));
-    // Neither the far end of another scope nor an unissued id names a live lease.
-    for raw in [u64::MAX, 0] {
+    // Neither the far end of another scope nor the flight's id names a live lease.
+    for raw in [u64::MAX, SEQUENCE_MAX] {
         assert_eq!(
-            refresher.store(Lease::from_raw(raw), t(12), t(0), RULES),
+            refresher.store(lease_of(raw), t(12), t(0), RULES),
             Err(Refusal::Stale)
         );
     }
@@ -150,7 +153,7 @@ fn zero_capacity_refuses_everything() {
     let roomy = Small::new();
     assert_eq!((roomy.flight_capacity(), roomy.waiter_capacity()), (2, 3));
     assert_eq!(
-        std::format!("{}", Refusal::Rejected),
+        std::format!("{}", Refusal::ZeroLead),
         "lead duration must be positive"
     );
 }

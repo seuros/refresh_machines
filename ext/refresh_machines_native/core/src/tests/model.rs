@@ -20,6 +20,11 @@ pub(super) const fn rules(policy: [u64; 3]) -> Policy {
 pub(super) struct Rng(pub(super) u64);
 
 impl Rng {
+    /// A stream for `seed`, never the all-zero state xorshift is stuck in.
+    pub(super) const fn seeded(seed: u64) -> Self {
+        Self(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1)
+    }
+
     pub(super) fn next(&mut self) -> u64 {
         self.0 ^= self.0 << 13;
         self.0 ^= self.0 >> 7;
@@ -30,6 +35,21 @@ impl Rng {
     pub(super) fn below(&mut self, bound: u64) -> u64 {
         self.next() % bound
     }
+
+    /// An index into something `len` long (`len > 0`).
+    pub(super) fn index(&mut self, len: usize) -> usize {
+        usize::try_from(self.below(len as u64)).expect("index")
+    }
+
+    /// One of `items` (non-empty).
+    pub(super) fn pick<T: Copy>(&mut self, items: &[T]) -> T {
+        items[self.index(items.len())]
+    }
+}
+
+/// The scope a seeded run uses: zero, a middling one or the last, by turns.
+pub(super) fn scope_for(seed: u64, middle: u16) -> u16 {
+    [0, middle, u16::MAX][usize::try_from(seed % 3).expect("index")]
 }
 
 #[derive(Clone, Copy)]
@@ -44,6 +64,11 @@ impl Held {
     /// Wide arithmetic instead of the core's saturating/subtracting forms.
     pub(super) fn age_at(&self, now: u64) -> u128 {
         u128::from(self.age) + u128::from(now - self.stored_at)
+    }
+
+    /// [`Self::age_at`] in ticks; the streams keep ages small.
+    pub(super) fn ticks_at(&self, now: u64) -> u64 {
+        u64::try_from(self.age_at(now)).expect("small ages")
     }
 
     pub(super) fn fresh(&self, now: u64) -> bool {
@@ -86,7 +111,7 @@ pub(super) struct Model {
     pub(super) ready: VecDeque<(WaiterId, u64, Outcome)>,
     pub(super) seen: Vec<WaiterId>,
     /// The flight each waiter was told it shares, checked when it is woken.
-    pub(super) told: BTreeMap<WaiterId, FlightId>,
+    pub(super) told: BTreeMap<u64, FlightId>,
     /// Ids issued so far, of every kind: one sequence for the refresher.
     pub(super) issued: u64,
     pub(super) scope: u16,
@@ -137,11 +162,11 @@ impl Model {
             return Expect::Refusal(Refusal::TimeRegressed);
         }
         if lead_for == 0 {
-            return Expect::Refusal(Refusal::Rejected);
+            return Expect::Refusal(Refusal::ZeroLead);
         }
         let live = self.flying.get(&key).is_some_and(|f| now < f.deadline);
         let held = self.held.get(&key).copied();
-        let age = held.map(|h| u64::try_from(h.age_at(now)).expect("small ages"));
+        let age = held.map(|h| h.ticks_at(now));
         let quiet = held.is_some_and(|h| now < h.retry_at);
         let expect = match (held, age) {
             (Some(h), Some(age)) if h.fresh(now) => Expect::Fresh(t(age)),
@@ -183,6 +208,19 @@ impl Model {
         Some(key)
     }
 
+    /// Metadata stored at `now` without backoff, by `store` or `put`; both
+    /// are honoured calls, so the clock advances.
+    pub(super) fn hold(&mut self, key: u64, now: u64, age: u64, policy: [u64; 3]) {
+        let held = Held {
+            stored_at: now,
+            age,
+            policy,
+            retry_at: 0,
+        };
+        self.held.insert(key, held);
+        self.now = now;
+    }
+
     pub(super) fn room(&self, key: u64) -> bool {
         self.held.contains_key(&key) || self.held.len() < KEYS
     }
@@ -209,7 +247,7 @@ pub(super) fn observe(
                 "wait names the flight"
             );
             model.seen.push(waiter);
-            model.told.insert(waiter, flight);
+            model.told.insert(waiter.raw(), flight);
             if let Some(flying) = model.flying.get_mut(&key) {
                 flying.followers.push(waiter);
             }
@@ -232,7 +270,7 @@ pub(super) fn agree(refresher: &Core, model: &Model, probe: u64) {
     );
     for key in 0..6 {
         let held = model.held.get(&key);
-        let age = held.map(|h| u64::try_from(h.age_at(probe)).expect("small ages"));
+        let age = held.map(|h| h.ticks_at(probe));
         assert_eq!(refresher.age(key, t(probe)), age.map(t));
         let state = held.map(|h| {
             if h.fresh(probe) {

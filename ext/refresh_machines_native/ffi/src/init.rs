@@ -1,16 +1,25 @@
 //! Private native entry point.
 use crate::{
     FLIGHT_CAPACITY, KEY_CAPACITY, Refresher, WAITER_CAPACITY, policy_if_error, policy_state,
-    policy_while_revalidate, scope_of_id,
+    policy_while_revalidate, scope_of_id, values,
 };
-use magnus::{Error, RClass, Ruby, function, method, prelude::*};
+use magnus::{Error, Ruby, function, method, prelude::*};
 
 #[magnus::init]
 fn init(ruby: &Ruby) -> Result<(), Error> {
     let module = ruby.define_module("RefreshMachines")?;
+    crate::answers::resolve(ruby, module)?;
     module.define_singleton_method("scope_of", function!(scope_of_id, 1))?;
+    // Validation hooks for the Data values; lib/ makes them private.
+    module.define_singleton_method("__nanos", function!(values::nanos, 1))?;
+    module.define_singleton_method("__duration", function!(values::duration, 1))?;
+    module.define_singleton_method("__lease", function!(values::lease, 1))?;
+    module.define_singleton_method("__wait", function!(values::wait, 2))?;
+    module.define_singleton_method("__notification", function!(values::notification, 4))?;
+    module.define_singleton_method("__refusal", function!(values::refusal, 1))?;
+    module.define_singleton_method("__revalidation", function!(values::revalidation, 1))?;
     // Policy is a Data class defined in Ruby; its arithmetic lives here.
-    let policy: RClass = module.const_get("Policy")?;
+    let policy = crate::answers::classes(ruby)?.policy;
     policy.define_method("state", method!(policy_state, 1))?;
     policy.define_method("while_revalidate?", method!(policy_while_revalidate, 1))?;
     policy.define_method("if_error?", method!(policy_if_error, 1))?;

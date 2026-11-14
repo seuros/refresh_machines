@@ -1,5 +1,4 @@
 //! Leases and the coalesce flights they ride on.
-use periscope_machines::scoped;
 
 use super::{RULES, Small, fetch, revalidation, t, wait};
 use crate::*;
@@ -22,13 +21,8 @@ fn a_live_lease_names_the_flight_its_waiters_are_woken_with() {
     let mut out = [Notification::default(); 2];
     assert_eq!(refresher.drain(&mut out), 1);
     assert_eq!(
-        out[0],
-        Notification {
-            waiter,
-            flight,
-            key: 42,
-            outcome: Outcome::Completed,
-        }
+        Some(out[0]),
+        Notification::new(waiter, flight, 42, Outcome::Completed)
     );
     assert_eq!(out[1], Notification::default());
     // Reported: the lease is stale and names no flight any more.
@@ -80,33 +74,8 @@ fn a_wait_names_the_flight_of_the_live_lease_it_shares() {
     assert_eq!(refresher.store(heir, t(12), t(0), RULES), Ok(()));
     for waiter in [first, second] {
         let note = refresher.poll().expect("woken");
-        assert_eq!((note.waiter, note.flight), (waiter, shared));
+        assert_eq!((note.waiter(), note.flight()), (waiter, shared));
     }
-}
-
-#[test]
-fn a_takeover_issues_a_new_lease_for_the_same_flight() {
-    let mut refresher = Small::new();
-    let Ok(Decision::Fetch { lease: dead }) = refresher.decide(5, t(0), t(10)) else {
-        panic!("leads");
-    };
-    let flight = refresher.flight(dead).expect("live");
-    let waiter = wait(&mut refresher, 5, 9);
-    // Overdue but not replaced: still the lease that reports, still mapped.
-    assert_eq!(refresher.flight(dead), Some(flight));
-    let Ok(Decision::Fetch { lease: heir }) = refresher.decide(5, t(10), t(10)) else {
-        panic!("takes over");
-    };
-    assert_ne!(heir, dead);
-    assert_eq!(refresher.flight(dead), None);
-    assert_eq!(refresher.flight(heir), Some(flight));
-    assert_eq!(refresher.fail(heir, t(11), t(0)), Ok(None));
-    let note = refresher.poll().expect("waiter kept across the takeover");
-    assert_eq!(
-        (note.waiter, note.flight, note.outcome),
-        (waiter, flight, Outcome::Abandoned)
-    );
-    assert_eq!(refresher.flight(heir), None);
 }
 
 #[test]
@@ -143,34 +112,6 @@ fn every_way_a_lease_ends_also_ends_its_mapping() {
 }
 
 #[test]
-fn leases_that_were_never_issued_or_belong_elsewhere_name_no_flight() {
-    let mut near = Small::with_scope(1);
-    let mut far = Small::with_scope(2);
-    let near_lease = fetch(&mut near, 7, 0);
-    let far_lease = fetch(&mut far, 7, 0);
-    assert_eq!(near.flight(far_lease), None);
-    assert_eq!(far.flight(near_lease), None);
-    for raw in [0, 1, scoped(1, 3), u64::MAX] {
-        assert_eq!(near.flight(Lease::from_raw(raw)), None);
-    }
-    // A lease is not its flight, and the flight's id is not a lease: both
-    // come from the one sequence, so they are never equal.
-    let flight = near.flight(near_lease).expect("live");
-    assert_eq!(
-        (near_lease.raw(), flight.raw()),
-        (scoped(1, 1), scoped(1, 2))
-    );
-    assert_eq!(near.flight(Lease::from_raw(flight.raw())), None);
-    let waiter = wait(&mut near, 7, 1);
-    assert_eq!(waiter.scope(), 1);
-    assert_eq!(near.flight(Lease::from_raw(waiter.raw())), None);
-    let second = fetch(&mut near, 8, 1);
-    let second_flight = near.flight(second).expect("live");
-    assert_ne!(second.raw(), second_flight.raw());
-    assert_eq!(near.flight(Lease::from_raw(second_flight.raw())), None);
-}
-
-#[test]
 fn coalesce_refusals_convert() {
     for (from, to) in [
         (
@@ -186,4 +127,22 @@ fn coalesce_refusals_convert() {
     ] {
         assert_eq!(Refusal::from(from), to);
     }
+}
+
+#[test]
+fn a_wait_is_rebuilt_only_from_ids_one_refresher_answers_together() {
+    let mut refresher = Small::with_scope(5);
+    let lease = fetch(&mut refresher, 7, 0);
+    let flight = refresher.flight(lease).expect("live");
+    let waiter = wait(&mut refresher, 7, 1);
+    assert_eq!(
+        Decision::wait(waiter, flight),
+        Some(Decision::Wait { waiter, flight })
+    );
+    let id = |raw| WaiterId::from_raw(raw).expect("a nonzero sequence");
+    let flight_of = |raw| FlightId::from_raw(raw).expect("a nonzero sequence");
+    // Another scope, or a waiter issued no later than its flight: no such wait.
+    assert_eq!(Decision::wait(id(waiter.raw() ^ (1 << 48)), flight), None);
+    assert_eq!(Decision::wait(id(flight.raw()), flight), None);
+    assert_eq!(Decision::wait(waiter, flight_of(waiter.raw() + 1)), None);
 }

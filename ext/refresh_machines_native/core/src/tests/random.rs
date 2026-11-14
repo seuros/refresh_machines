@@ -1,6 +1,7 @@
 //! Random operation streams checked against the naive model.
 use super::model::*;
 use super::std::vec::Vec;
+use super::waiter_of;
 use crate::*;
 
 /// The random inputs one step may use.
@@ -37,7 +38,7 @@ fn draw(rng: &mut Rng, model: &Model) -> Draw {
             model.id(sequence)
         }
     } else {
-        live[usize::try_from(rng.below(live.len() as u64)).expect("index")]
+        rng.pick(&live)
     };
     Draw {
         key: rng.below(6),
@@ -103,16 +104,7 @@ fn store(refresher: &mut Core, model: &mut Model, d: &Draw) {
     };
     if expect.is_ok() {
         let key = model.settle(lease, Outcome::Completed).expect("live lease");
-        model.held.insert(
-            key,
-            Held {
-                stored_at: now,
-                age,
-                policy,
-                retry_at: 0,
-            },
-        );
-        model.now = now;
+        model.hold(key, now, age, policy);
     }
     assert_eq!(
         refresher.store(Lease(lease), t(now), t(age), rules(policy)),
@@ -136,8 +128,7 @@ fn fail(rng: &mut Rng, refresher: &mut Core, model: &mut Model, d: &Draw) {
         model.now = now;
         Ok(model.held.get_mut(&key).and_then(|h| {
             h.retry_at = now + retry_after;
-            h.sie(now)
-                .then(|| u64::try_from(h.age_at(now)).expect("small ages"))
+            h.sie(now).then(|| h.ticks_at(now))
         }))
     } else {
         Err(Refusal::Stale)
@@ -187,16 +178,7 @@ fn put(refresher: &mut Core, model: &mut Model, d: &Draw) {
     let expect = if regressed {
         Err(Refusal::TimeRegressed)
     } else if model.room(key) {
-        model.held.insert(
-            key,
-            Held {
-                stored_at: now,
-                age,
-                policy,
-                retry_at: 0,
-            },
-        );
-        model.now = now;
+        model.hold(key, now, age, policy);
         Ok(())
     } else {
         Err(Refusal::EntriesFull)
@@ -207,7 +189,7 @@ fn put(refresher: &mut Core, model: &mut Model, d: &Draw) {
 fn sweep(rng: &mut Rng, refresher: &mut Core, model: &mut Model, d: &Draw) {
     let Draw { now, regressed, .. } = *d;
     let mut out = [u64::MAX; 2];
-    let room = usize::try_from(rng.below(3)).expect("index");
+    let room = rng.index(3);
     let found = refresher.sweep(t(now), &mut out[..room]);
     if regressed {
         assert_eq!(found, Err(Refusal::TimeRegressed));
@@ -231,21 +213,20 @@ fn sweep(rng: &mut Rng, refresher: &mut Core, model: &mut Model, d: &Draw) {
 }
 
 fn cancel(rng: &mut Rng, refresher: &mut Core, model: &mut Model) {
-    let known = model.seen.len() as u64;
     let live: Vec<u64> = model.flying.values().map(|f| f.lease).collect();
-    let waiter = if known == 0 || rng.below(5) == 0 {
-        WaiterId::from_raw(rng.next())
+    let waiter = if model.seen.is_empty() || rng.below(5) == 0 {
+        waiter_of(rng.next() | 1)
     } else if !live.is_empty() && rng.below(4) == 0 {
         // A live lease, or the flight it rides on, rebuilt as a waiter id.
-        let lease = live[usize::try_from(rng.below(live.len() as u64)).expect("index")];
+        let lease = rng.pick(&live);
         let flight = refresher.flight(Lease(lease)).expect("a live lease");
-        WaiterId::from_raw([lease, flight.raw()][usize::from(rng.below(2) == 0)])
+        waiter_of([lease, flight.raw()][usize::from(rng.below(2) == 0)])
     } else if rng.below(5) == 0 {
         // A waiter that is known here, as another scope would have issued it.
-        let twin = model.seen[usize::try_from(rng.below(known)).expect("index")];
-        WaiterId::from_raw(twin.raw() ^ (1 << 48))
+        let twin = rng.pick(&model.seen);
+        waiter_of(twin.raw() ^ (1 << 48))
     } else {
-        model.seen[usize::try_from(rng.below(known)).expect("index")]
+        rng.pick(&model.seen)
     };
     let queued = model.ready.iter().position(|(w, _, _)| *w == waiter);
     let expect = if let Some(index) = queued {
@@ -267,7 +248,7 @@ fn cancel(rng: &mut Rng, refresher: &mut Core, model: &mut Model) {
 
 fn drain(rng: &mut Rng, refresher: &mut Core, model: &mut Model) {
     let mut out = [Notification::default(); 2];
-    let room = usize::try_from(rng.below(3)).expect("index");
+    let room = rng.index(3);
     let written = refresher.drain(&mut out[..room]);
     assert_eq!(written, model.ready.len().min(room));
     assert!(
@@ -277,8 +258,8 @@ fn drain(rng: &mut Rng, refresher: &mut Core, model: &mut Model) {
     );
     for note in out.iter().take(written) {
         let expect = model.ready.pop_front().expect("model has it queued");
-        assert_eq!((note.waiter, note.key, note.outcome), expect);
-        assert_eq!(model.told.get(&note.waiter), Some(&note.flight));
+        assert_eq!((note.waiter(), note.key(), note.outcome()), expect);
+        assert_eq!(model.told.get(&note.waiter().raw()), Some(&note.flight()));
     }
 }
 
@@ -290,12 +271,12 @@ fn reorder(refresher: &Core, model: &mut Model, before: usize) {
     let mut peek = refresher.clone();
     let mut actual = Vec::new();
     while let Some(note) = peek.poll() {
-        actual.push((note.waiter, note.key, note.outcome));
+        actual.push((note.waiter(), note.key(), note.outcome()));
     }
     let mut fresh: Vec<_> = model.ready.drain(before..).collect();
     let mut sorted = actual[before.min(actual.len())..].to_vec();
-    fresh.sort_by_key(|(waiter, ..)| *waiter);
-    sorted.sort_by_key(|(waiter, ..)| *waiter);
+    fresh.sort_by_key(|(waiter, ..)| waiter.raw());
+    sorted.sort_by_key(|(waiter, ..)| waiter.raw());
     assert_eq!(fresh, sorted, "reap woke a different set of waiters");
     model.ready.extend(actual.into_iter().skip(before));
 }
@@ -303,9 +284,8 @@ fn reorder(refresher: &Core, model: &mut Model, before: usize) {
 #[test]
 fn random_operations_agree_with_a_naive_model() {
     for seed in 1..=40_u64 {
-        let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
-        // Scope zero, a middling scope and the last one.
-        let scope = [0, 7, u16::MAX][usize::try_from(seed % 3).expect("index")];
+        let mut rng = Rng::seeded(seed);
+        let scope = scope_for(seed, 7);
         let mut refresher = Refresher::<KEYS, FLIGHTS, WAITERS>::with_scope(scope);
         assert_eq!(refresher.scope(), scope);
         let mut model = Model {

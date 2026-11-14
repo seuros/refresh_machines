@@ -3,10 +3,11 @@
 
 use core::time::Duration;
 
-use coalesce_machines::{Coalescer, Joined};
+use coalesce_machines::Coalescer;
 pub use coalesce_machines::{FlightId, Notification, Outcome, WaiterId};
 
 mod decision;
+mod lead;
 mod lease;
 mod policy;
 mod refusal;
@@ -27,6 +28,17 @@ struct Entry {
 }
 
 impl Entry {
+    /// Metadata for a value that arrived at `now`, with no failure backoff.
+    const fn new(key: u64, now: Duration, age: Duration, policy: Policy) -> Self {
+        Self {
+            key,
+            stored_at: now,
+            age,
+            policy,
+            retry_at: Duration::ZERO,
+        }
+    }
+
     const fn age_at(&self, now: Duration) -> Duration {
         self.age.saturating_add(now.saturating_sub(self.stored_at))
     }
@@ -131,7 +143,7 @@ impl<const KEYS: usize, const FLIGHTS: usize, const WAITERS: usize>
     ///
     /// # Errors
     ///
-    /// [`Refusal::TimeRegressed`], then [`Refusal::Rejected`] for a zero
+    /// [`Refusal::TimeRegressed`], then [`Refusal::ZeroLead`] for a zero
     /// `lead_for`, and, only when nothing is servable, a full table before a
     /// spent sequence: [`Refusal::FlightsFull`] or [`Refusal::WaitersFull`],
     /// then [`Refusal::Exhausted`]. A new refresh takes two ids, its lease and
@@ -145,7 +157,7 @@ impl<const KEYS: usize, const FLIGHTS: usize, const WAITERS: usize>
     ) -> Result<Decision, Refusal> {
         self.check(now)?;
         if lead_for.is_zero() {
-            return Err(Refusal::Rejected);
+            return Err(Refusal::ZeroLead);
         }
         let live = self
             .lead_slot(key)
@@ -204,15 +216,8 @@ impl<const KEYS: usize, const FLIGHTS: usize, const WAITERS: usize>
         self.check(now)?;
         let (slot, lead) = self.held(lease).ok_or(Refusal::Stale)?;
         let home = self.room_for(lead.key).ok_or(Refusal::EntriesFull)?;
-        self.flights.complete(lead.flight)?;
-        self.leads[slot] = None;
-        self.entries[home] = Some(Entry {
-            key: lead.key,
-            stored_at: now,
-            age,
-            policy,
-            retry_at: Duration::ZERO,
-        });
+        self.settle(slot, lead.flight, Outcome::Completed)?;
+        self.entries[home] = Some(Entry::new(lead.key, now, age, policy));
         self.now = now;
         Ok(())
     }
@@ -236,8 +241,7 @@ impl<const KEYS: usize, const FLIGHTS: usize, const WAITERS: usize>
     ) -> Result<Option<Duration>, Refusal> {
         self.check(now)?;
         let (slot, lead) = self.held(lease).ok_or(Refusal::Stale)?;
-        self.flights.abandon(lead.flight)?;
-        self.leads[slot] = None;
+        self.settle(slot, lead.flight, Outcome::Abandoned)?;
         self.now = now;
         let Some(entry) = self
             .entry_slot(lead.key)
@@ -260,8 +264,7 @@ impl<const KEYS: usize, const FLIGHTS: usize, const WAITERS: usize>
     /// [`Refusal::Stale`] when the lease is not live. Nothing changes.
     pub fn abandon(&mut self, lease: Lease) -> Result<(), Refusal> {
         let (slot, lead) = self.held(lease).ok_or(Refusal::Stale)?;
-        self.flights.abandon(lead.flight)?;
-        self.leads[slot] = None;
+        self.settle(slot, lead.flight, Outcome::Abandoned)?;
         Ok(())
     }
 
@@ -278,10 +281,14 @@ impl<const KEYS: usize, const FLIGHTS: usize, const WAITERS: usize>
         self.check(now)?;
         self.now = now;
         let mut revoked = 0;
-        for slot in &mut self.leads {
-            if let Some(lead) = slot.filter(|lead| now >= lead.deadline) {
-                *slot = None;
-                revoked += usize::from(self.flights.abandon(lead.flight).is_ok());
+        for slot in 0..FLIGHTS {
+            let Some(lead) = self.leads[slot].filter(|lead| now >= lead.deadline) else {
+                continue;
+            };
+            // A lead whose flight is not in the air stays put rather than
+            // vanish uncounted; `settle` flags the broken invariant.
+            if self.settle(slot, lead.flight, Outcome::Abandoned).is_ok() {
+                revoked += 1;
             }
         }
         Ok(revoked)
@@ -305,13 +312,7 @@ impl<const KEYS: usize, const FLIGHTS: usize, const WAITERS: usize>
     ) -> Result<(), Refusal> {
         self.check(now)?;
         let home = self.room_for(key).ok_or(Refusal::EntriesFull)?;
-        self.entries[home] = Some(Entry {
-            key,
-            stored_at: now,
-            age,
-            policy,
-            retry_at: Duration::ZERO,
-        });
+        self.entries[home] = Some(Entry::new(key, now, age, policy));
         self.now = now;
         Ok(())
     }
@@ -531,61 +532,6 @@ impl<const KEYS: usize, const FLIGHTS: usize, const WAITERS: usize>
             .iter()
             .enumerate()
             .find_map(|(slot, lead)| Some((slot, lead.filter(|lead| lead.lease == lease.0)?)))
-    }
-
-    /// Issue a lease for `key`: a new refresh, or a takeover of an overdue one.
-    ///
-    /// Every check comes before the first id is drawn, so a refused lead
-    /// consumes none: a full table first, the spent sequence last, in the
-    /// order the coalescer itself refuses a join.
-    fn lead(&mut self, key: u64, now: Duration, lead_for: Duration) -> Result<Lease, Refusal> {
-        let deadline = now.saturating_add(lead_for);
-        if let Some(lead) = self
-            .lead_slot(key)
-            .and_then(|slot| self.leads[slot].as_mut())
-        {
-            // A takeover: a new lease on the flight already in the air.
-            let lease = self.flights.reserve()?;
-            lead.lease = lease;
-            lead.deadline = deadline;
-            return Ok(Lease(lease));
-        }
-        let slot = self
-            .leads
-            .iter()
-            .position(Option::is_none)
-            .ok_or(Refusal::FlightsFull)?;
-        // A lease and a flight: with one id left, neither is drawn.
-        if self.flights.remaining() < 2 {
-            return Err(Refusal::Exhausted);
-        }
-        let lease = self.flights.reserve()?;
-        let flight = match self.flights.join(key)? {
-            Joined::Leader(flight) => flight,
-            // Unreachable while every flight has a lead; undo and refuse.
-            Joined::Follower { waiter, .. } => {
-                self.flights.cancel(waiter)?;
-                return Err(Refusal::Stale);
-            }
-        };
-        self.leads[slot] = Some(Lead {
-            lease,
-            key,
-            flight,
-            deadline,
-        });
-        Ok(Lease(lease))
-    }
-
-    fn follow(&mut self, key: u64) -> Result<(WaiterId, FlightId), Refusal> {
-        match self.flights.join(key)? {
-            Joined::Follower { waiter, flight } => Ok((waiter, flight)),
-            // Unreachable while every lead has a flight; undo and refuse.
-            Joined::Leader(flight) => {
-                self.flights.abandon(flight)?;
-                Err(Refusal::Stale)
-            }
-        }
     }
 }
 

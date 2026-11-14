@@ -2,38 +2,11 @@
 //! equal, and a restart resumes the sequence instead of starting it again.
 use periscope_machines::{SEQUENCE_MAX, scoped};
 
-use super::model::Rng;
+use super::model::{Rng, scope_for};
 use super::std::collections::BTreeSet;
 use super::std::vec::Vec;
-use super::{RULES, Small, fetch, t, wait};
+use super::{As, Small, fetch, lease_of, names_nothing, t, wait, waiter_of};
 use crate::*;
-
-/// `raw` through every method that takes a lease and the one that takes a
-/// waiter: all refuse, and the refresher is left as it was.
-fn names_nothing<const K: usize, const F: usize, const W: usize>(
-    refresher: &Refresher<K, F, W>,
-    raw: u64,
-    as_lease: bool,
-    as_waiter: bool,
-) {
-    let mut probe = refresher.clone();
-    let now = refresher.now();
-    if as_lease {
-        let lease = Lease::from_raw(raw);
-        assert_eq!(probe.store(lease, now, t(0), RULES), Err(Refusal::Stale));
-        assert_eq!(probe.fail(lease, now, t(1)), Err(Refusal::Stale));
-        assert_eq!(probe.abandon(lease), Err(Refusal::Stale));
-        assert_eq!(probe.flight(lease), None);
-    }
-    if as_waiter {
-        assert_eq!(
-            probe.cancel(WaiterId::from_raw(raw)),
-            Err(Refusal::Stale),
-            "id {raw:#x} cancelled a waiter"
-        );
-    }
-    assert_eq!(probe, *refresher, "id {raw:#x} changed the refresher");
-}
 
 /// The review's sequence: with leases and waiter ids on separate counters, a
 /// lease cancelled another key's waiter and a waiter id abandoned another
@@ -52,24 +25,21 @@ fn regression_a_lease_and_a_waiter_id_never_name_each_other() {
     assert_ne!(l2.raw(), waiter.raw());
 
     let before = refresher.clone();
+    assert_eq!(refresher.cancel(waiter_of(l2.raw())), Err(Refusal::Stale));
     assert_eq!(
-        refresher.cancel(WaiterId::from_raw(l2.raw())),
-        Err(Refusal::Stale)
-    );
-    assert_eq!(
-        refresher.abandon(Lease::from_raw(waiter.raw())),
+        refresher.abandon(lease_of(waiter.raw())),
         Err(Refusal::Stale)
     );
     assert_eq!(refresher, before);
 
     // No id of one kind works as another, through any method.
     let flights = [l1, l2].map(|lease| refresher.flight(lease).expect("live"));
-    names_nothing(&refresher, waiter.raw(), true, false);
+    names_nothing(&refresher, waiter.raw(), As::Lease);
     for lease in [l1, l2] {
-        names_nothing(&refresher, lease.raw(), false, true);
+        names_nothing(&refresher, lease.raw(), As::Waiter);
     }
     for flight in flights {
-        names_nothing(&refresher, flight.raw(), true, true);
+        names_nothing(&refresher, flight.raw(), As::Either);
     }
 
     // Key 1's waiter and key 2's refresh are both still there.
@@ -83,8 +53,8 @@ fn regression_a_lease_and_a_waiter_id_never_name_each_other() {
 fn no_lease_ever_equals_a_waiter_or_flight_id_live_or_past() {
     type Core = Refresher<3, 3, 4>;
     for seed in 1..=24_u64 {
-        let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
-        let scope = [0, 11, u16::MAX][usize::try_from(seed % 3).expect("index")];
+        let mut rng = Rng::seeded(seed);
+        let scope = scope_for(seed, 11);
         let mut refresher = Core::with_scope(scope);
         let (mut leases, mut others) = (BTreeSet::new(), BTreeSet::new());
         let mut live: Vec<Lease> = Vec::new();
@@ -92,7 +62,7 @@ fn no_lease_ever_equals_a_waiter_or_flight_id_live_or_past() {
         for _ in 0..2_000 {
             now += rng.below(3);
             let key = rng.below(5);
-            let pick = usize::try_from(rng.below(live.len().max(1) as u64)).expect("index");
+            let pick = rng.index(live.len().max(1));
             let lease = live.get(pick).copied();
             let issued = refresher.issued();
             let led = match rng.below(8) {
@@ -143,12 +113,12 @@ fn no_lease_ever_equals_a_waiter_or_flight_id_live_or_past() {
             assert_eq!((leases.len() + others.len()) as u64, refresher.issued());
             // A lease, live or long gone, is nobody's waiter; a waiter or
             // flight id, live or long gone, is nobody's lease.
-            let nth = usize::try_from(rng.below(16)).expect("index");
+            let nth = rng.index(16);
             if let Some(raw) = leases.iter().rev().nth(nth) {
-                names_nothing(&refresher, *raw, false, true);
+                names_nothing(&refresher, *raw, As::Waiter);
             }
             if let Some(raw) = others.iter().rev().nth(nth) {
-                names_nothing(&refresher, *raw, true, false);
+                names_nothing(&refresher, *raw, As::Lease);
             }
         }
         assert!(
@@ -181,7 +151,7 @@ fn a_resumed_refresher_continues_the_sequence() {
     assert_eq!((again.raw(), follower.raw()), (scoped(6, 4), scoped(6, 6)));
     // What outlived the restart names nothing here.
     for raw in [lease.raw(), waiter.raw(), flight.raw()] {
-        names_nothing(&second, raw, true, true);
+        names_nothing(&second, raw, As::Either);
     }
 
     // A fresh refresher in the same scope would have honoured both.

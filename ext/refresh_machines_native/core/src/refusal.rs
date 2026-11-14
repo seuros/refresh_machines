@@ -6,7 +6,7 @@ pub enum Refusal {
     /// `now` is earlier than a time this refresher already accepted.
     TimeRegressed,
     /// A zero lead duration: the lease would be overdue before it was issued.
-    Rejected,
+    ZeroLead,
     /// Every metadata slot holds another key.
     EntriesFull,
     /// Every refresh slot holds an unsettled refresh; no new key can be led.
@@ -23,7 +23,7 @@ impl fmt::Display for Refusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::TimeRegressed => "time moved backwards",
-            Self::Rejected => "lead duration must be positive",
+            Self::ZeroLead => "lead duration must be positive",
             Self::EntriesFull => "every metadata slot is in use",
             Self::FlightsFull => "every refresh slot is in use",
             Self::WaitersFull => "every waiter slot is in use",

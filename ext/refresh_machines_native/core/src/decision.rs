@@ -1,6 +1,6 @@
 use core::time::Duration;
 
-use coalesce_machines::{FlightId, WaiterId};
+use coalesce_machines::{FlightId, Joined, WaiterId};
 
 use crate::{Lease, Refusal};
 
@@ -56,6 +56,21 @@ pub enum Decision {
         /// the key's live lease, and the [`crate::Notification::flight`] to come.
         flight: FlightId,
     },
+}
+
+impl Decision {
+    /// A [`Decision::Wait`], rebuilt from its two ids.
+    ///
+    /// `None` unless they are ids one refresher could have answered together,
+    /// as [`Joined::follower`] judges: the same scope, the waiter issued after
+    /// the flight it waits on. The ids are not looked up.
+    #[must_use]
+    pub const fn wait(waiter: WaiterId, flight: FlightId) -> Option<Self> {
+        match Joined::follower(waiter, flight) {
+            Some(_) => Some(Self::Wait { waiter, flight }),
+            None => None,
+        }
+    }
 }
 
 /// What [`crate::Refresher::forget`] did. Both are honoured; neither is a refusal.

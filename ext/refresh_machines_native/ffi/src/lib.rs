@@ -1,16 +1,18 @@
 //! Thin binding to the bounded freshness and refresh-lease policy.
+mod answers;
 mod init;
+mod values;
 
 use std::{cell::RefCell, time::Duration};
 
 use magnus::{
-    Error, Integer, RArray, RClass, Ruby, Symbol, TryConvert, Value, prelude::*, typed_data::Obj,
+    Error, Integer, RArray, Ruby, Symbol, TryConvert, Value, prelude::*, typed_data::Obj,
 };
 use periscope_machines::scope_of;
 use refresh_machines::{
-    Decision, FlightId, Forgetting, Lease, Notification, Outcome, Policy, Refresher as Core,
-    Refusal, Revalidation, State, WaiterId,
+    FlightId, Forgetting, Lease, Notification, Policy, Refresher as Core, Refusal, State,
 };
+use values::{lease_id, waiter_id};
 
 /// `RefreshMachines.scope_of(id)`: the scope a lease, waiter or flight id was issued under.
 const fn scope_of_id(id: Number) -> u16 {
@@ -24,17 +26,26 @@ const WAITER_CAPACITY: usize = 256;
 #[derive(Clone, Copy)]
 struct Number(u64);
 
+/// `TypeError` unless `value` is an Integer; its range is the caller's to check.
+fn integer(value: Value, message: &'static str) -> Result<(), Error> {
+    if Integer::from_value(value).is_some() {
+        return Ok(());
+    }
+    Err(Error::new(
+        Ruby::get_with(value).exception_type_error(),
+        message,
+    ))
+}
+
 impl TryConvert for Number {
     fn try_convert(value: Value) -> Result<Self, Error> {
-        if Integer::from_value(value).is_none() {
-            return Err(Error::new(
-                Ruby::get_with(value).exception_type_error(),
-                "expected an Integer (unsigned 64-bit)",
-            ));
-        }
+        integer(value, "expected an Integer (unsigned 64-bit)")?;
         u64::try_convert(value).map(Self)
     }
 }
+
+/// The `TypeError` message for an instant or span that is not an Integer.
+const NANOS_TYPE: &str = "expected Integer nanoseconds";
 
 /// An instant or a span: Integer nanoseconds in `0..2**64-1`.
 #[derive(Clone, Copy)]
@@ -42,14 +53,15 @@ struct Nanos(Duration);
 
 impl TryConvert for Nanos {
     fn try_convert(value: Value) -> Result<Self, Error> {
-        if Integer::from_value(value).is_none() {
-            return Err(Error::new(
-                Ruby::get_with(value).exception_type_error(),
-                "expected Integer nanoseconds",
-            ));
-        }
+        integer(value, NANOS_TYPE)?;
         u64::try_convert(value).map(|nanos| Self(Duration::from_nanos(nanos)))
     }
+}
+
+/// How much of a `capacity`-long buffer a `max` asks for: past the capacity
+/// there is never more to take, so it is the whole buffer.
+fn room(max: Number, capacity: usize) -> usize {
+    usize::try_from(max.0).map_or(capacity, |max| max.min(capacity))
 }
 
 /// A duration as Integer nanoseconds, exact however large.
@@ -63,41 +75,36 @@ struct Scope(u16);
 
 impl TryConvert for Scope {
     fn try_convert(value: Value) -> Result<Self, Error> {
-        let ruby = Ruby::get_with(value);
-        if Integer::from_value(value).is_none() {
-            return Err(Error::new(
-                ruby.exception_type_error(),
-                "scope must be an Integer",
-            ));
-        }
-        u16::try_convert(value)
-            .map(Self)
-            .map_err(|_| Error::new(ruby.exception_range_error(), "scope must be in 0..=65535"))
+        integer(value, "scope must be an Integer")?;
+        u16::try_convert(value).map(Self).map_err(|_| {
+            let ruby = Ruby::get_with(value);
+            Error::new(ruby.exception_range_error(), "scope must be in 0..=65535")
+        })
     }
 }
 
-/// A `RefreshMachines::Policy`, read field by field so every one is validated.
+/// A `RefreshMachines::Policy`: exactly that class (see
+/// [`answers::members_of`]), each window converted again, since
+/// `Marshal.load` skips `initialize`.
 #[derive(Clone, Copy)]
 struct Rules(Policy);
 
 impl TryConvert for Rules {
     fn try_convert(value: Value) -> Result<Self, Error> {
         let ruby = Ruby::get_with(value);
-        let class: RClass = ruby.define_module("RefreshMachines")?.const_get("Policy")?;
-        if !value.is_kind_of(class) {
+        let Some([fresh, revalidate, if_error]) =
+            answers::members_of(value, answers::classes(&ruby)?.policy)?
+        else {
             return Err(Error::new(
                 ruby.exception_type_error(),
                 "expected a RefreshMachines::Policy",
             ));
-        }
-        let field = |name: &str| -> Result<Duration, Error> {
-            let raw: Value = value.funcall(name, ())?;
-            Nanos::try_convert(raw).map(|nanos| nanos.0)
         };
+        let window = |raw: Value| Nanos::try_convert(raw).map(|nanos| nanos.0);
         Ok(Self(Policy::new(
-            field("fresh_for")?,
-            field("stale_while_revalidate")?,
-            field("stale_if_error")?,
+            window(fresh)?,
+            window(revalidate)?,
+            window(if_error)?,
         )))
     }
 }
@@ -106,7 +113,7 @@ impl TryConvert for Rules {
 const fn refusal_name(refused: Refusal) -> &'static str {
     match refused {
         Refusal::TimeRegressed => "time_regressed",
-        Refusal::Rejected => "rejected",
+        Refusal::ZeroLead => "zero_lead",
         Refusal::EntriesFull => "entries_full",
         Refusal::FlightsFull => "flights_full",
         Refusal::WaitersFull => "waiters_full",
@@ -134,21 +141,6 @@ fn state_name(ruby: &Ruby, state: State) -> Symbol {
     })
 }
 
-fn data(ruby: &Ruby, name: &str) -> Result<Value, Error> {
-    ruby.define_module("RefreshMachines")?.const_get(name)
-}
-
-fn notification(ruby: &Ruby, class: Value, note: Notification) -> Result<Value, Error> {
-    let outcome = ruby.to_symbol(match note.outcome {
-        Outcome::Completed => "completed",
-        Outcome::Abandoned => "abandoned",
-    });
-    class.funcall(
-        "new",
-        (note.waiter.raw(), note.flight.raw(), note.key, outcome),
-    )
-}
-
 fn policy_state(ruby: &Ruby, this: Value, age: Nanos) -> Result<Symbol, Error> {
     Ok(state_name(ruby, Rules::try_convert(this)?.0.state(age.0)))
 }
@@ -161,9 +153,11 @@ fn policy_if_error(this: Value, age: Nanos) -> Result<bool, Error> {
     Ok(Rules::try_convert(this)?.0.if_error(age.0))
 }
 
+type Held = Core<KEY_CAPACITY, FLIGHT_CAPACITY, WAITER_CAPACITY>;
+
 #[magnus::wrap(class = "RefreshMachines::Refresher", free_immediately, size)]
 struct Refresher {
-    core: RefCell<Core<KEY_CAPACITY, FLIGHT_CAPACITY, WAITER_CAPACITY>>,
+    core: RefCell<Held>,
 }
 
 impl Refresher {
@@ -209,37 +203,13 @@ impl Refresher {
         lead_for: Nanos,
     ) -> Result<Value, Error> {
         this.check_frozen()?;
-        // Resolve the classes before deciding, so a failure registers nothing.
-        let class = |name| data(ruby, name);
-        let classes = (
-            class("Fresh")?,
-            class("Stale")?,
-            class("Fetch")?,
-            class("Wait")?,
-        );
-        let parts = (class("Lead")?, class("Backoff")?, class("Unavailable")?);
-        let decision = this.core.borrow_mut().decide(key.0, now.0, lead_for.0);
-        match decision {
-            Ok(Decision::Fresh { age }) => classes.0.funcall("new", (nanos(ruby, age),)),
-            Ok(Decision::Stale { age, revalidation }) => {
-                let revalidation: Value = match revalidation {
-                    Revalidation::Lead(lease) => parts.0.funcall("new", (lease.raw(),))?,
-                    Revalidation::InFlight => ruby.to_symbol("in_flight").as_value(),
-                    Revalidation::Backoff { until } => {
-                        parts.1.funcall("new", (nanos(ruby, until),))?
-                    }
-                    Revalidation::Unavailable(refused) => {
-                        parts.2.funcall("new", (refusal(ruby, refused),))?
-                    }
-                };
-                classes.1.funcall("new", (nanos(ruby, age), revalidation))
+        let classes = answers::classes(ruby)?;
+        Self::on_copy(ruby, this, |core| {
+            match core.decide(key.0, now.0, lead_for.0) {
+                Ok(decision) => classes.decision(ruby, decision),
+                Err(refused) => Ok(refusal(ruby, refused)),
             }
-            Ok(Decision::Fetch { lease }) => classes.2.funcall("new", (lease.raw(),)),
-            Ok(Decision::Wait { waiter, flight }) => {
-                classes.3.funcall("new", (waiter.raw(), flight.raw()))
-            }
-            Err(refused) => Ok(refusal(ruby, refused)),
-        }
+        })
     }
 
     fn store(
@@ -251,10 +221,8 @@ impl Refresher {
         policy: Rules,
     ) -> Result<Value, Error> {
         this.check_frozen()?;
-        let outcome =
-            this.core
-                .borrow_mut()
-                .store(Lease::from_raw(lease.0), now.0, age.0, policy.0);
+        let lease = lease_id(ruby, lease)?;
+        let outcome = this.core.borrow_mut().store(lease, now.0, age.0, policy.0);
         Ok(done(ruby, outcome, "stored"))
     }
 
@@ -266,10 +234,8 @@ impl Refresher {
         retry_after: Nanos,
     ) -> Result<Value, Error> {
         this.check_frozen()?;
-        let outcome = this
-            .core
-            .borrow_mut()
-            .fail(Lease::from_raw(lease.0), now.0, retry_after.0);
+        let lease = lease_id(ruby, lease)?;
+        let outcome = this.core.borrow_mut().fail(lease, now.0, retry_after.0);
         Ok(match outcome {
             Ok(Some(age)) => nanos(ruby, age).as_value(),
             Ok(None) => ruby.qnil().as_value(),
@@ -279,7 +245,8 @@ impl Refresher {
 
     fn abandon(ruby: &Ruby, this: Obj<Self>, lease: Number) -> Result<Value, Error> {
         this.check_frozen()?;
-        let outcome = this.core.borrow_mut().abandon(Lease::from_raw(lease.0));
+        let lease = lease_id(ruby, lease)?;
+        let outcome = this.core.borrow_mut().abandon(lease);
         Ok(done(ruby, outcome, "abandoned"))
     }
 
@@ -316,48 +283,79 @@ impl Refresher {
 
     fn sweep(ruby: &Ruby, this: Obj<Self>, now: Nanos, max: Number) -> Result<Value, Error> {
         this.check_frozen()?;
-        let room = usize::try_from(max.0).map_or(KEY_CAPACITY, |max| max.min(KEY_CAPACITY));
-        let mut buffer = [0_u64; KEY_CAPACITY];
-        let outcome = this.core.borrow_mut().sweep(now.0, &mut buffer[..room]);
-        let written = match outcome {
-            Ok(written) => written,
-            Err(refused) => return Ok(refusal(ruby, refused)),
-        };
-        let keys = ruby.ary_new_capa(written);
-        for key in buffer.iter().take(written) {
-            keys.push(*key)?;
-        }
-        Ok(keys.as_value())
+        let room = room(max, KEY_CAPACITY);
+        Self::on_copy(ruby, this, |core| {
+            let mut buffer = [0_u64; KEY_CAPACITY];
+            let written = match core.sweep(now.0, &mut buffer[..room]) {
+                Ok(written) => written,
+                Err(refused) => return Ok(refusal(ruby, refused)),
+            };
+            let keys = ruby.ary_new_capa(written);
+            for key in buffer.iter().take(written) {
+                keys.push(*key)?;
+            }
+            Ok(keys.as_value())
+        })
     }
 
     fn cancel(ruby: &Ruby, this: Obj<Self>, waiter: Number) -> Result<Value, Error> {
         this.check_frozen()?;
-        let outcome = this.core.borrow_mut().cancel(WaiterId::from_raw(waiter.0));
+        let waiter = waiter_id(ruby, waiter)?;
+        let outcome = this.core.borrow_mut().cancel(waiter);
         Ok(done(ruby, outcome, "cancelled"))
     }
 
     fn poll(ruby: &Ruby, this: Obj<Self>) -> Result<Option<Value>, Error> {
         this.check_frozen()?;
-        // Resolve the class before taking anything, so a failure loses nothing.
-        let class = data(ruby, "Notification")?;
-        let polled = this.core.borrow_mut().poll();
-        polled
-            .map(|note| notification(ruby, class, note))
-            .transpose()
+        let classes = answers::classes(ruby)?;
+        Self::on_copy(ruby, this, |core| {
+            core.poll()
+                .map(|note| classes.notification(ruby, note))
+                .transpose()
+        })
     }
 
+    /// Read into a buffer, then built, inside one [`Self::on_copy`].
     fn drain(ruby: &Ruby, this: Obj<Self>, max: Number) -> Result<RArray, Error> {
         this.check_frozen()?;
-        // Resolve the class before taking anything, so a failure loses nothing.
-        let class = data(ruby, "Notification")?;
-        let room = usize::try_from(max.0).map_or(WAITER_CAPACITY, |max| max.min(WAITER_CAPACITY));
-        let mut buffer = [Notification::default(); WAITER_CAPACITY];
-        let written = this.core.borrow_mut().drain(&mut buffer[..room]);
-        let notifications = ruby.ary_new_capa(written);
-        for note in buffer.iter().take(written) {
-            notifications.push(notification(ruby, class, *note)?)?;
+        let classes = answers::classes(ruby)?;
+        let room = room(max, WAITER_CAPACITY);
+        Self::on_copy(ruby, this, |core| {
+            let mut buffer = [Notification::default(); WAITER_CAPACITY];
+            let written = core.drain(&mut buffer[..room]);
+            let notifications = ruby.ary_new_capa(written);
+            for note in buffer.iter().take(written) {
+                notifications.push(classes.notification(ruby, *note)?)?;
+            }
+            Ok(notifications)
+        })
+    }
+
+    /// Runs `act`, which builds a Ruby answer, on a copy of the refresher and
+    /// keeps the copy only once the answer exists. The receiver is checked
+    /// frozen up front and again right before the store: frozen meanwhile
+    /// raises `FrozenError`, changed meanwhile (a call back in while the
+    /// answer was built) raises `RuntimeError`, and in both cases nothing is
+    /// applied. No borrow is held while `act` runs.
+    fn on_copy<R>(
+        ruby: &Ruby,
+        this: Obj<Self>,
+        act: impl FnOnce(&mut Held) -> Result<R, Error>,
+    ) -> Result<R, Error> {
+        this.check_frozen()?;
+        let before = this.core.borrow().clone();
+        let mut after = before.clone();
+        let answer = act(&mut after)?;
+        this.check_frozen()?;
+        let mut held = this.core.borrow_mut();
+        if *held != before {
+            return Err(Error::new(
+                ruby.exception_runtime_error(),
+                "the refresher changed while the answer was built; the call was not applied",
+            ));
         }
-        Ok(notifications)
+        *held = after;
+        Ok(answer)
     }
 
     fn age(ruby: &Ruby, this: &Self, key: Number, now: Nanos) -> Option<Integer> {
@@ -379,11 +377,9 @@ impl Refresher {
         self.core.borrow().leading(key.0).map(Lease::raw)
     }
 
-    fn flight(&self, lease: Number) -> Option<u64> {
-        self.core
-            .borrow()
-            .flight(Lease::from_raw(lease.0))
-            .map(FlightId::raw)
+    fn flight(ruby: &Ruby, this: &Self, lease: Number) -> Result<Option<u64>, Error> {
+        let lease = lease_id(ruby, lease)?;
+        Ok(this.core.borrow().flight(lease).map(FlightId::raw))
     }
 
     fn now(ruby: &Ruby, this: &Self) -> Integer {

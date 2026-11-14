@@ -3,11 +3,15 @@ module RefreshMachines
 
   # Every instant (`now`, `Backoff#until`) and span (ages, policy windows,
   # `lead_for`, `retry_after`) is Integer nanoseconds. Arguments must be in
-  # 0..2**64-1; a returned sum may be larger, it never wraps.
+  # 0..2**64-1; a returned sum may be larger, up to the core's Duration::MAX,
+  # it never wraps.
+  #
+  # Every Data value validates when built, by the gem or by hand: TypeError
+  # for the wrong type, RangeError for a value the core rejects.
   type state = :fresh | :stale | :expired
   # Refusals: the call was not honoured and changed nothing. Every reason has
   # its own symbol; there is no catch-all.
-  type refusal = :time_regressed | :rejected | :entries_full | :flights_full
+  type refusal = :time_regressed | :zero_lead | :entries_full | :flights_full
                | :waiters_full | :exhausted | :stale
 
   # The scope (0..65_535) a lease, waiter or flight id was issued under: the
@@ -25,6 +29,8 @@ module RefreshMachines
     def if_error?: (Integer age) -> bool
   end
 
+  # Ages and instants answered by the core: Integer nanoseconds in
+  # 0..Duration::MAX (about 1.8e28).
   class Fresh < Data
     attr_reader age: Integer
     def self.new: (Integer age) -> Fresh
@@ -42,13 +48,16 @@ module RefreshMachines
   end
 
   # Ids are Integers: lease ids, waiter ids and flight ids, all from the one
-  # sequence of their refresher, so no two ids of a refresher are equal.
+  # sequence of their refresher, so no two ids of a refresher are equal. An id
+  # whose sequence (the low 48 bits) is zero raises RangeError, in a Data
+  # value and as an argument alike.
   class Fetch < Data
     attr_reader lease: Integer
     def self.new: (Integer lease) -> Fetch
                 | (lease: Integer) -> Fetch
   end
 
+  # The waiter is of the flight's scope and issued after it, else RangeError.
   class Wait < Data
     attr_reader waiter: Integer
     attr_reader flight: Integer
@@ -68,15 +77,15 @@ module RefreshMachines
                 | (until: Integer) -> Backoff
   end
 
+  # Why the refresh was not registered: any refusal symbol (RangeError for
+  # another symbol). `decide` answers it with :flights_full or :exhausted.
   class Unavailable < Data
-    # Why the refresh was not registered.
-    type reason = :flights_full | :exhausted
-
-    attr_reader refusal: reason
-    def self.new: (reason refusal) -> Unavailable
-                | (refusal: reason) -> Unavailable
+    attr_reader refusal: refusal
+    def self.new: (refusal refusal) -> Unavailable
+                | (refusal: refusal) -> Unavailable
   end
 
+  # The waiter is of the flight's scope and issued after it, else RangeError.
   class Notification < Data
     type outcome = :completed | :abandoned
 
@@ -105,9 +114,13 @@ module RefreshMachines
     # Ids issued so far, of every kind (leases, waiter ids, flight ids, all
     # from one sequence): the count to save for `resumed`.
     def issued: () -> Integer
-    # Honoured: Fresh, Stale, Fetch, Wait. Refused: :time_regressed, :rejected,
+    # Methods taking a lease or waiter id raise RangeError for a zero sequence,
+    # before the core is asked. Every honoured decide, store, fail, reap, put
+    # and sweep records `now` (each answer depends on it); a refusal records
+    # nothing.
+    # Honoured: Fresh, Stale, Fetch, Wait. Refused: :time_regressed, :zero_lead,
     # and, only when nothing is servable, :flights_full, :waiters_full, :exhausted.
-    def decide: (Integer key, Integer now, Integer lead_for) -> (Fresh | Stale | Fetch | Wait | :time_regressed | :rejected | :flights_full | :waiters_full | :exhausted)
+    def decide: (Integer key, Integer now, Integer lead_for) -> (Fresh | Stale | Fetch | Wait | :time_regressed | :zero_lead | :flights_full | :waiters_full | :exhausted)
     # Honoured: :stored. Refused: :time_regressed, :stale, :entries_full.
     def store: (Integer lease, Integer now, Integer age, Policy policy) -> (:stored | :time_regressed | :stale | :entries_full)
     # Honoured: the age of the value that covers for the failure, or nil when
@@ -122,13 +135,15 @@ module RefreshMachines
     # Honoured: :forgotten when there was metadata to drop, and the repeat
     # :not_held when the key had none (nothing changes). Never refuses.
     def forget: (Integer key) -> (:forgotten | :not_held)
-    # Honoured: the swept keys. Refused: :time_regressed.
+    # Honoured: at most `max` swept keys (a `max` past CAPACITY sweeps
+    # whatever is expired, which is never more). Refused: :time_regressed.
     def sweep: (Integer now, Integer max) -> (Array[Integer] | :time_regressed)
     # Honoured: :cancelled. Refused: :stale.
     def cancel: (Integer waiter) -> (:cancelled | :stale)
     # The oldest queued notification, or nil when nothing is queued. Never refuses.
     def poll: () -> Notification?
-    # At most `max` queued notifications, oldest first. Never refuses.
+    # At most `max` queued notifications, oldest first (a `max` past
+    # WAITER_CAPACITY takes them all, which is never more). Never refuses.
     def drain: (Integer max) -> Array[Notification]
     def age: (Integer key, Integer now) -> Integer?
     def state: (Integer key, Integer now) -> state?

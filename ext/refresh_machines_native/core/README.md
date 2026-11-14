@@ -26,7 +26,9 @@ use refresh_machines::{Decision, Policy, Refresher, Revalidation};
 let s = Duration::from_secs;
 // Fresh for 60s, then 30s more while revalidating, 300s more if the origin errors.
 let rules = Policy::new(s(60), s(30), s(300));
-let mut refresher = Refresher::<8, 4, 16>::new();
+// Its own scope: two refreshers built with `new()` are both scope zero, so
+// their ids alias and one handed to the other can name a live lease there.
+let mut refresher = Refresher::<8, 4, 16>::with_scope(1);
 
 // Nothing cached: this caller fetches, with 10s to report back.
 let Ok(Decision::Fetch { lease }) = refresher.decide(42, s(0), s(10)) else { panic!("miss") };
@@ -59,7 +61,9 @@ assert_eq!(
 - **Time and ages.** Every instant and every span is a `core::time::Duration`:
   `now` is monotonic time since an epoch the caller picks, and `lead_for`,
   `retry_after`, ages and the three policy windows are spans. Every mutating
-  call takes `now` and refuses an earlier one with `Refusal::TimeRegressed`.
+  call takes `now` and refuses an earlier one with `Refusal::TimeRegressed`;
+  a zero `lead_for` is `Refusal::ZeroLead`, a lease overdue before it is
+  issued.
   `store` and `put` take the value's age on arrival, so a response that was
   already old upstream starts old here. Ages, deadlines and backoffs saturate
   at `Duration::MAX`.
@@ -135,6 +139,22 @@ assert_eq!(
   so the decision is honoured, and the registration that failed changed nothing
   (no lease, no flight, no waiter). The next caller tries again.
 - **Refusals change nothing.** Every `Err` leaves the refresher as it was.
+- **Which answers record the clock.** A refusal records nothing. Every
+  honoured `decide`, `store`, `fail`, `put`, `reap` and `sweep` records `now`,
+  because each answer depends on it: a decision on the age and the lease
+  deadline at `now` (including `Stale` with `Revalidation::Unavailable`, which
+  is honoured and so advances the clock), a stored value's age counting from
+  `now`, `fail`'s covering age and backoff, which leases are overdue and which
+  entries expired at `now`, even when none are. `abandon`, `forget`,
+  `cancel`, `poll` and `drain` take no time and record none.
+- **Ids are never zero.** `Lease::from_raw` answers `None` for a sequence of
+  zero, as `FlightId::from_raw` and `WaiterId::from_raw` do: no refresher
+  issues one. Ids are not ordered: each carries its refresher's scope, and an
+  order across scopes means nothing.
+- **Rebuilt decisions.** `Decision::wait(waiter, flight)` rebuilds a
+  `Decision::Wait` only from ids one refresher could answer together (the
+  same scope, the waiter issued after its flight), as
+  `coalesce_machines::Joined::follower` judges; `None` otherwise.
 - **Housekeeping.** `forget(key)` drops metadata when the cache evicts the
   value. It never refuses and answers `Forgetting::Forgotten`, or
   `Forgetting::NotHeld` when the key already had none: an idempotent repeat

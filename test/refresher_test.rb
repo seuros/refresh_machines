@@ -178,7 +178,8 @@ class RefresherTest < Minitest::Test
     assert_equal 1, near.flight(near_fetch.lease) >> 48
     assert_nil near.flight(far_fetch.lease)
     assert_nil far.flight(near_fetch.lease)
-    assert_nil @refresher.flight(0)
+    assert_raises(RangeError) { @refresher.flight(0) }
+    assert_raises(RangeError) { @refresher.flight(7 << 48) }
     assert_nil @refresher.flight(MAX)
     assert_equal :abandoned, near.abandon(near_fetch.lease)
     assert_nil near.flight(near_fetch.lease)
@@ -316,14 +317,14 @@ class RefresherTest < Minitest::Test
   end
 
   def test_refusals_are_symbols_and_change_nothing
-    assert_equal :rejected, @refresher.decide(1, 5, 0)
+    assert_equal :zero_lead, @refresher.decide(1, 5, 0)
     assert_equal 0, @refresher.now
     fetch = @refresher.decide(1, 5, 100)
     assert_equal :time_regressed, @refresher.decide(1, 4, 100)
     assert_equal :time_regressed, @refresher.store(fetch.lease, 4, 0, RULES)
     assert_equal :time_regressed, @refresher.fail(fetch.lease, 4, 0)
     assert_equal :time_regressed, @refresher.put(2, 4, 0, RULES)
-    assert_equal :stale, @refresher.store(0, 5, 0, RULES)
+    assert_raises(RangeError) { @refresher.store(0, 5, 0, RULES) }
     assert_equal :stale, @refresher.store(MAX, 5, 0, RULES)
     assert_equal fetch.lease, @refresher.leading(1)
   end

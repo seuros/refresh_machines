@@ -2,6 +2,7 @@
 extern crate std;
 
 use super::*;
+use core::assert_matches;
 
 mod flight;
 mod limits;
@@ -23,6 +24,16 @@ const fn t(seconds: u64) -> Duration {
 }
 
 type Small = Refresher<3, 2, 3>;
+
+/// A lease rebuilt from an id the test knows has a nonzero sequence.
+fn lease_of(raw: u64) -> Lease {
+    Lease::from_raw(raw).expect("a nonzero sequence")
+}
+
+/// A waiter id rebuilt from an id the test knows has a nonzero sequence.
+fn waiter_of(raw: u64) -> WaiterId {
+    WaiterId::from_raw(raw).expect("a nonzero sequence")
+}
 
 fn fetch<const K: usize, const F: usize, const W: usize>(
     refresher: &mut Refresher<K, F, W>,
@@ -61,6 +72,43 @@ fn near_the_end<const K: usize, const F: usize, const W: usize>(
         .expect("short of the end is within the sequence")
 }
 
+/// Which methods [`names_nothing`] hands an id to.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum As {
+    /// `store`, `fail`, `abandon` and `flight`.
+    Lease,
+    /// `cancel`.
+    Waiter,
+    /// All of them.
+    Either,
+}
+
+/// `raw` through the methods `role` names: all refuse (or answer `None`),
+/// and the refresher is left as it was.
+fn names_nothing<const K: usize, const F: usize, const W: usize>(
+    refresher: &Refresher<K, F, W>,
+    raw: u64,
+    role: As,
+) {
+    let mut probe = refresher.clone();
+    let now = refresher.now();
+    if role != As::Waiter {
+        let lease = lease_of(raw);
+        assert_eq!(probe.store(lease, now, t(0), RULES), Err(Refusal::Stale));
+        assert_eq!(probe.fail(lease, now, t(1)), Err(Refusal::Stale));
+        assert_eq!(probe.abandon(lease), Err(Refusal::Stale));
+        assert_eq!(probe.flight(lease), None);
+    }
+    if role != As::Lease {
+        assert_eq!(
+            probe.cancel(waiter_of(raw)),
+            Err(Refusal::Stale),
+            "id {raw:#x} cancelled a waiter"
+        );
+    }
+    assert_eq!(probe, *refresher, "id {raw:#x} changed the refresher");
+}
+
 fn revalidation(decision: Result<Decision, Refusal>) -> (Duration, Revalidation) {
     match decision {
         Ok(Decision::Stale { age, revalidation }) => (age, revalidation),
@@ -94,12 +142,12 @@ fn miss_is_fetched_once_and_waiters_are_notified_when_it_lands() {
     );
     let note = refresher.poll().expect("first waiter");
     assert_eq!(
-        (note.waiter, note.key, note.outcome),
+        (note.waiter(), note.key(), note.outcome()),
         (first, 42, Outcome::Completed)
     );
     let mut out = [Notification::default(); 4];
     assert_eq!(refresher.drain(&mut out), 1);
-    assert_eq!(out[0].waiter, second);
+    assert_eq!(out[0].waiter(), second);
     assert_eq!(
         refresher.decide(42, t(4), t(100)),
         Ok(Decision::Fresh { age: t(1) })
@@ -148,7 +196,10 @@ fn past_the_revalidate_window_callers_block_and_errors_fall_back_to_stale() {
     let waiter = wait(&mut refresher, 7, 16);
     assert_eq!(refresher.fail(lease, t(17), t(5)), Ok(Some(t(17))));
     let note = refresher.poll().expect("waiter woken");
-    assert_eq!((note.waiter, note.outcome), (waiter, Outcome::Abandoned));
+    assert_eq!(
+        (note.waiter(), note.outcome()),
+        (waiter, Outcome::Abandoned)
+    );
     // Until the backoff ends everybody is served stale and nobody refetches.
     assert_eq!(
         revalidation(refresher.decide(7, t(21), t(100))),
@@ -187,18 +238,18 @@ fn failure_inside_the_revalidate_window_backs_off_without_stale_if_error() {
         revalidation(refresher.decide(1, t(12), t(100))),
         (t(12), Revalidation::Backoff { until: t(13) })
     );
-    assert!(matches!(
+    assert_matches!(
         revalidation(refresher.decide(1, t(13), t(100))),
         (age, Revalidation::Lead(_)) if age == t(13)
-    ));
+    );
     // A miss that fails records nothing.
     let lease = fetch(&mut refresher, 2, 13);
     assert_eq!(refresher.fail(lease, t(13), t(50)), Ok(None));
     assert_eq!(refresher.state(2, t(13)), None);
-    assert!(matches!(
+    assert_matches!(
         refresher.decide(2, t(13), t(100)),
         Ok(Decision::Fetch { .. })
-    ));
+    );
 }
 
 #[test]
@@ -210,7 +261,7 @@ fn abandon_records_no_failure_and_the_next_caller_leads() {
     assert_eq!(refresher.abandon(lease), Ok(()));
     assert_eq!(refresher.abandon(lease), Err(Refusal::Stale));
     assert_eq!(refresher.fail(lease, t(20), t(1)), Err(Refusal::Stale));
-    assert_eq!(refresher.poll().map(|note| note.waiter), Some(waiter));
+    assert_eq!(refresher.poll().map(Notification::waiter), Some(waiter));
     assert_ne!(fetch(&mut refresher, 7, 20), lease);
 }
 
@@ -236,7 +287,10 @@ fn overdue_lease_is_taken_over_and_waiters_follow_the_new_leader() {
     assert_eq!(refresher.abandon(dead), Err(Refusal::Stale));
     assert_eq!(refresher.store(lease, t(12), t(0), RULES), Ok(()));
     let note = refresher.poll().expect("waiter kept across the takeover");
-    assert_eq!((note.waiter, note.outcome), (waiter, Outcome::Completed));
+    assert_eq!(
+        (note.waiter(), note.outcome()),
+        (waiter, Outcome::Completed)
+    );
 
     // The same for a background revalidation.
     let (_, lead) = revalidation(refresher.decide(5, t(22), t(3)));
@@ -248,7 +302,7 @@ fn overdue_lease_is_taken_over_and_waiters_follow_the_new_leader() {
         Revalidation::InFlight
     );
     let (_, lead) = revalidation(refresher.decide(5, t(25), t(3)));
-    assert!(matches!(lead, Revalidation::Lead(lease) if lease != dead));
+    assert_matches!(lead, Revalidation::Lead(lease) if lease != dead);
 }
 
 #[test]
@@ -268,7 +322,10 @@ fn reap_revokes_overdue_leases_and_wakes_their_waiters() {
         Err(Refusal::Stale)
     );
     let note = refresher.poll().expect("waiter woken");
-    assert_eq!((note.waiter, note.outcome), (waiter, Outcome::Abandoned));
+    assert_eq!(
+        (note.waiter(), note.outcome()),
+        (waiter, Outcome::Abandoned)
+    );
     assert_eq!(refresher.leading(2), Some(patient));
     assert_eq!(refresher.reap(t(4)), Err(Refusal::TimeRegressed));
     // An overdue lease nobody reaped or replaced still reports.
@@ -289,7 +346,7 @@ fn capacity_refusals_change_nothing() {
     }
     let before = refresher.clone();
     assert_eq!(refresher.decide(2, t(5), t(100)), Err(Refusal::WaitersFull));
-    assert_eq!(refresher.decide(1, t(5), t(0)), Err(Refusal::Rejected));
+    assert_eq!(refresher.decide(1, t(5), t(0)), Err(Refusal::ZeroLead));
     assert_eq!(refresher, before);
     assert_eq!(refresher.now(), t(0));
 
@@ -388,5 +445,6 @@ fn waiters_can_cancel_before_and_after_the_refresh_settles() {
     assert_eq!(refresher.pending(), 1);
     assert_eq!(refresher.cancel(late), Ok(()));
     assert_eq!(refresher.poll(), None);
-    assert_eq!(refresher.cancel(WaiterId::from_raw(0)), Err(Refusal::Stale));
+    // Zero is no id at all: it cannot even be rebuilt as one.
+    assert_eq!((Lease::from_raw(0), WaiterId::from_raw(0)), (None, None));
 }
