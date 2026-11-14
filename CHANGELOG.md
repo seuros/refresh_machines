@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.1](https://github.com/seuros/refresh_machines/compare/refresh_machines/v0.6.0...refresh_machines/v0.6.1) (2026-11-14)
+
+
+### Bug Fixes
+
+* **deps:** require matryona-machines &gt;= 0.3 and read revalidation with which ([92860cb](https://github.com/seuros/refresh_machines/commit/92860cb8bf82a4159e45c4a0301590c6e185120d))
+
 ## [0.6.0](https://github.com/seuros/refresh_machines/compare/refresh_machines/v0.5.0...refresh_machines/v0.6.0) (2026-11-14)
 
 
