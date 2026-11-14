@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.7.0](https://github.com/seuros/refresh_machines/compare/refresh-machines-v0.6.0...refresh-machines-v0.7.0) (2026-11-14)
+
+
+### ⚠ BREAKING CHANGES
+
+* seal values, native Policy and Stale checks by exact class, clone-then-keep decide/sweep/poll/drain
+
+### Features
+
+* seal values, native Policy and Stale checks by exact class, clone-then-keep decide/sweep/poll/drain ([5a6b1f8](https://github.com/seuros/refresh_machines/commit/5a6b1f8ac6907696939d2ad443836d8336f03365))
+
 ## [0.6.0](https://github.com/seuros/refresh_machines/compare/refresh-machines-v0.5.0...refresh-machines-v0.6.0) (2026-11-13)
 
 
