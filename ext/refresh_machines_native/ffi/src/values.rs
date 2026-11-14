@@ -1,12 +1,12 @@
 //! Private hooks that hold every `RefreshMachines` Data value to what the
 //! core accepts, whether the gem built it or the caller did.
 
-use magnus::{Error, Ruby, Symbol, Value};
-use matryona_machines::ruby::{Symbols, duration, exact_fields, instant, integer, which};
+use magnus::{Error, Ruby, Value};
+use matryona_machines::ruby::{Choice, Symbols, duration, instant, integer, symbol_or_fields};
 use refresh_machines::{Decision, FlightId, Lease, Notification, WaiterId};
 
 use crate::Refusals;
-use crate::answers::{Outcomes, classes};
+use crate::answers::{Outcomes, Revalidations, classes};
 
 /// `__policy`: the three windows `Policy::new` takes, each Integer
 /// nanoseconds in `0..2**64-1`, named for its field.
@@ -80,31 +80,18 @@ const NOT_ONE: &str = "revalidation must be a Lead, :in_flight, a Backoff or an 
 /// skips `initialize`). `RangeError` for another Symbol, `TypeError` for
 /// anything else.
 pub fn revalidation(ruby: &Ruby, value: Value) -> Result<Value, Error> {
-    if let Some(symbol) = Symbol::from_value(value) {
-        let name = symbol.name()?;
-        if name == "in_flight" {
-            return Ok(value);
-        }
-        return Err(Error::new(
-            ruby.exception_range_error(),
-            format!("unknown revalidation :{name}"),
-        ));
-    }
     let classes = classes(ruby)?;
     let one_of = [
         classes.lead.get(ruby),
         classes.backoff.get(ruby),
         classes.unavailable.get(ruby),
     ];
-    let Some(index) = which(value, &one_of) else {
-        return Err(Error::new(ruby.exception_type_error(), NOT_ONE));
-    };
-    // Each class has one member; `which` chose the class it is exactly.
-    let [field] = exact_fields(ruby, value, one_of[index], NOT_ONE)?;
-    match index {
-        0 => self::lease(ruby, field).map(drop),
-        1 => self::until(field),
-        _ => refusal(ruby, field).map(drop),
+    // Each class has one member, read from the struct.
+    match symbol_or_fields(ruby, value, Revalidations, &one_of, NOT_ONE)? {
+        Choice::Symbol(_) => Ok(()),
+        Choice::Struct(0, [field]) => self::lease(ruby, field).map(drop),
+        Choice::Struct(1, [field]) => self::until(field),
+        Choice::Struct(_, [field]) => refusal(ruby, field).map(drop),
     }?;
     Ok(value)
 }

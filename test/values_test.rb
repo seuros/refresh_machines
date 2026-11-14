@@ -60,6 +60,16 @@ class ValuesTest < Minitest::Test
     assert_raises(TypeError) { R::Stale.new(1, R::Fetch.new(ID)) }
   end
 
+  # Any Symbol but :in_flight, a data variant's name included, is refused
+  # with the same message as a value of the wrong class.
+  def test_a_refused_revalidation_names_what_it_may_hold
+    message = 'revalidation must be a Lead, :in_flight, a Backoff or an Unavailable'
+    %i[nope lead backoff unavailable].each do |name|
+      assert_equal message, assert_raises(RangeError) { R::Stale.new(1, name) }.message
+    end
+    assert_equal message, assert_raises(TypeError) { R::Stale.new(1, ID) }.message
+  end
+
   def test_ids_never_have_a_zero_sequence
     assert_equal ID, R::Fetch.new(ID).lease
     assert_equal ID, R::Lead.new(lease: ID).lease

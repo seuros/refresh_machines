@@ -8,7 +8,7 @@
 //! calls build on a copy of the refresher kept only once the answer exists.
 
 use magnus::{Error, IntoValue, RClass, RModule, RStruct, Ruby, TryConvert, Value, prelude::*};
-use matryona_machines::ruby::{Class, Registry, Symbols, nanoseconds, symbol};
+use matryona_machines::ruby::{Class, Registry, SymbolNames, Symbols, nanoseconds};
 use refresh_machines::{Decision, Notification, Outcome, Revalidation};
 
 use crate::refusal;
@@ -78,7 +78,9 @@ impl Classes {
             Decision::Stale { age, revalidation } => {
                 let revalidation = match revalidation {
                     Revalidation::Lead(lease) => build(self.lead.get(ruby), [id(lease.raw())])?,
-                    Revalidation::InFlight => symbol(ruby, "in_flight").as_value(),
+                    Revalidation::InFlight => {
+                        Revalidations::symbol(ruby, &Revalidation::InFlight).as_value()
+                    }
                     Revalidation::Backoff { until } => {
                         build(self.backoff.get(ruby), [span(until)])?
                     }
@@ -93,6 +95,17 @@ impl Classes {
                 build(self.wait.get(ruby), [id(waiter.raw()), id(flight.raw())])
             }
         }
+    }
+}
+
+matryona_machines::symbols! {
+    /// A `Stale#revalidation`'s kind. `:in_flight` is the one unit variant,
+    /// the only one that crosses as a Symbol; the others are `Data` values.
+    pub Revalidations for Revalidation as "revalidation" => names_only {
+        Lead(..) => "lead",
+        InFlight => "in_flight",
+        Backoff { .. } => "backoff",
+        Unavailable(..) => "unavailable",
     }
 }
 
