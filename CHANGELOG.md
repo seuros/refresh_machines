@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.7.0](https://github.com/seuros/refresh_machines/compare/refresh_machines/v0.6.1...refresh_machines/v0.7.0) (2026-11-14)
+
+
+### ⚠ BREAKING CHANGES
+
+* refresh revalidation reads through symbol_or_fields
+
+### Features
+
+* refresh revalidation reads through symbol_or_fields ([5ea9be7](https://github.com/seuros/refresh_machines/commit/5ea9be7d8a5b652e4a1ba32fddfdc9529f643b91))
+
 ## [0.6.1](https://github.com/seuros/refresh_machines/compare/refresh_machines/v0.6.0...refresh_machines/v0.6.1) (2026-11-14)
 
 
