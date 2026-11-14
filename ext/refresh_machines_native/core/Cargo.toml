@@ -6,13 +6,16 @@ rust-version.workspace = true
 license.workspace = true
 description = "Fresh/stale/expired cache metadata with stale-while-revalidate and stale-if-error decisions"
 readme = "README.md"
-exclude = ["src/**/tests.rs", "tests/"]
+exclude = ["src/**/tests.rs", "src/tests/", "tests/"]
 keywords = ["cache", "swr", "stale-if-error", "freshness", "no-std"]
 categories = ["no-std", "algorithms", "caching"]
 
 [dependencies]
 coalesce-machines.workspace = true
 periscope-machines.workspace = true
+
+[dev-dependencies]
+matryona-machines = { workspace = true, features = ["testing"] }
 
 [lints]
 workspace = true

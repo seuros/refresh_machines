@@ -1,5 +1,6 @@
 //! Scoped ids: what one refresher issued names nothing in another.
 use coalesce_machines::{Coalescer, Joined};
+use matryona_machines::testing::refuses;
 use periscope_machines::{SEQUENCE_MAX, scoped, sequence_of};
 
 use super::{As, RULES, Small, fetch, names_nothing, near_the_end, t, wait};
@@ -152,9 +153,7 @@ fn a_bare_coalescer_in_another_scope_cannot_cancel_a_refresh_waiter() {
     // Same sequence number, different scope: not the same id.
     assert_eq!(twin.raw(), 3);
     assert_eq!(waiter.raw(), scoped(1, 3));
-    let before = refresher.clone();
-    assert_eq!(refresher.cancel(twin), Err(Refusal::Stale));
-    assert_eq!(refresher, before);
+    refuses(&mut refresher, Refusal::Stale, |r| r.cancel(twin));
     assert_eq!(
         direct.cancel(waiter),
         Err(coalesce_machines::Refusal::Stale)
@@ -169,16 +168,18 @@ fn the_last_sequence_is_issued_as_a_flight_or_a_waiter_then_the_scope_is_spent()
     let lease = fetch(&mut refresher, 1, 0);
     assert_eq!(lease.raw(), u64::MAX - 1);
     assert_eq!(refresher.flight(lease).map(FlightId::raw), Some(u64::MAX));
-    let before = refresher.clone();
-    assert_eq!(refresher.decide(2, t(0), t(100)), Err(Refusal::Exhausted));
-    assert_eq!(refresher.decide(1, t(0), t(100)), Err(Refusal::Exhausted));
-    assert_eq!(refresher, before);
+    refuses(&mut refresher, Refusal::Exhausted, |r| {
+        r.decide(2, t(0), t(100))
+    });
+    refuses(&mut refresher, Refusal::Exhausted, |r| {
+        r.decide(1, t(0), t(100))
+    });
 
     // As a waiter id.
     let mut refresher: Small = near_the_end(u16::MAX, 3);
     fetch(&mut refresher, 1, 0);
     assert_eq!(wait(&mut refresher, 1, 0).raw(), u64::MAX);
-    let before = refresher.clone();
-    assert_eq!(refresher.decide(1, t(0), t(100)), Err(Refusal::Exhausted));
-    assert_eq!(refresher, before);
+    refuses(&mut refresher, Refusal::Exhausted, |r| {
+        r.decide(1, t(0), t(100))
+    });
 }

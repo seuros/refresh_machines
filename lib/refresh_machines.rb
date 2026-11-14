@@ -18,14 +18,14 @@ module RefreshMachines
   # `Duration::MAX`, because sums saturate instead of wrapping.
   Policy = Data.define(:fresh_for, :stale_while_revalidate, :stale_if_error) do
     def initialize(fresh_for:, stale_while_revalidate:, stale_if_error:)
-      [fresh_for, stale_while_revalidate, stale_if_error].each { RefreshMachines.__send__(:__nanos, it) }
+      RefreshMachines.__send__(:__policy, fresh_for, stale_while_revalidate, stale_if_error)
       super
     end
   end
   # Serve the cached value.
   Fresh = Data.define(:age) do
     def initialize(age:)
-      RefreshMachines.__send__(:__duration, age)
+      RefreshMachines.__send__(:__age, age)
       super
     end
   end
@@ -34,7 +34,7 @@ module RefreshMachines
   # or an Unavailable (a refresh is due but could not be registered).
   Stale = Data.define(:age, :revalidation) do
     def initialize(age:, revalidation:)
-      RefreshMachines.__send__(:__duration, age)
+      RefreshMachines.__send__(:__age, age)
       RefreshMachines.__send__(:__revalidation, revalidation)
       super
     end
@@ -66,7 +66,7 @@ module RefreshMachines
   # Stale#revalidation: the last refresh failed and asked for quiet `until` then.
   Backoff = Data.define(:until) do
     def initialize(until:)
-      RefreshMachines.__send__(:__duration, binding.local_variable_get(:until))
+      RefreshMachines.__send__(:__until, binding.local_variable_get(:until))
       super
     end
   end
@@ -95,7 +95,7 @@ end
 require 'refresh_machines_native/refresh_machines_native'
 
 module RefreshMachines
-  private_class_method :__nanos, :__duration, :__lease, :__wait, :__notification, :__refusal, :__revalidation
+  private_class_method :__policy, :__age, :__until, :__lease, :__wait, :__notification, :__refusal, :__revalidation
 
   # The values are sealed. `initialize` is where each validates, and a
   # subclass could override it, or `allocate` build an instance that never ran

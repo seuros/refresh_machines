@@ -17,32 +17,27 @@ pub(super) const fn rules(policy: [u64; 3]) -> Policy {
     Policy::new(t(policy[0]), t(policy[1]), t(policy[2]))
 }
 
-pub(super) struct Rng(pub(super) u64);
+pub(super) use matryona_machines::testing::XorShift64 as Rng;
 
-impl Rng {
-    /// A stream for `seed`, never the all-zero state xorshift is stuck in.
-    pub(super) const fn seeded(seed: u64) -> Self {
-        Self(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1)
-    }
+/// A stream for `seed`, spread over the state space.
+pub(super) const fn seeded(seed: u64) -> Rng {
+    Rng::new(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1)
+}
 
-    pub(super) fn next(&mut self) -> u64 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        self.0
-    }
-
-    pub(super) fn below(&mut self, bound: u64) -> u64 {
-        self.next() % bound
-    }
-
+/// What a run draws besides `below`.
+pub(super) trait Draws {
     /// An index into something `len` long (`len > 0`).
-    pub(super) fn index(&mut self, len: usize) -> usize {
+    fn index(&mut self, len: usize) -> usize;
+    /// One of `items` (non-empty).
+    fn pick<T: Copy>(&mut self, items: &[T]) -> T;
+}
+
+impl Draws for Rng {
+    fn index(&mut self, len: usize) -> usize {
         usize::try_from(self.below(len as u64)).expect("index")
     }
 
-    /// One of `items` (non-empty).
-    pub(super) fn pick<T: Copy>(&mut self, items: &[T]) -> T {
+    fn pick<T: Copy>(&mut self, items: &[T]) -> T {
         items[self.index(items.len())]
     }
 }

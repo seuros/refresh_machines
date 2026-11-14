@@ -28,6 +28,20 @@ class ValuesTest < Minitest::Test
     assert_raises(TypeError) { R::Policy.new(fresh_for: nil, stale_while_revalidate: 0, stale_if_error: 0) }
   end
 
+  # Every hook names the field it checks, not a generic "nanoseconds".
+  def test_a_refused_field_is_named
+    {
+      -> { R::Policy.new(-1, 0, 0) } => 'fresh_for must be in 0..=18446744073709551615',
+      -> { R::Policy.new(0, 2**64, 0) } => 'stale_while_revalidate must be in 0..=18446744073709551615',
+      -> { R::Fresh.new(DURATION_MAX + 1) } => 'age must be in 0..=Duration::MAX nanoseconds',
+      -> { R::Stale.new(-1, :in_flight) } => 'age must be in 0..=Duration::MAX nanoseconds',
+      -> { R::Backoff.new(-1) } => 'until must be in 0..=Duration::MAX nanoseconds'
+    }.each { |build, message| assert_equal message, assert_raises(RangeError, &build).message }
+    assert_equal 'stale_if_error must be an Integer', assert_raises(TypeError) { R::Policy.new(0, 0, 1.5) }.message
+    assert_equal 'outcome must be one of :completed, :abandoned',
+                 assert_raises(RangeError) { R::Notification.new(ID, ID, 1, :done) }.message
+  end
+
   def test_answered_ages_and_instants_reach_the_core_duration_max
     assert_equal DURATION_MAX, R::Fresh.new(DURATION_MAX).age
     assert_equal DURATION_MAX, R::Backoff.new(DURATION_MAX).until
@@ -90,7 +104,7 @@ class ValuesTest < Minitest::Test
   end
 
   def test_the_validation_hooks_are_private
-    %i[__nanos __duration __lease __wait __notification __refusal].each do |hook|
+    %i[__policy __age __until __lease __wait __notification __refusal __revalidation].each do |hook|
       assert_raises(NoMethodError) { R.public_send(hook, 1) }
     end
   end
@@ -190,6 +204,43 @@ class ValuesTest < Minitest::Test
     end
   end
 
+  # Frozen is checked before any argument is read: a bad argument to a frozen
+  # refresher is FrozenError, not TypeError.
+  def test_a_frozen_refresher_raises_before_reading_arguments
+    @refresher.freeze
+    [-> { @refresher.decide('1', 0, 100) }, -> { @refresher.store(1, 1.5, 0, RULES) },
+     -> { @refresher.fail(nil, 1, 1) }, -> { @refresher.abandon(:lease) }, -> { @refresher.reap(-1) },
+     -> { @refresher.put(3, 1, 0, Object.new) }, -> { @refresher.forget('1') }, -> { @refresher.sweep(1, nil) },
+     -> { @refresher.cancel(1.0) }, -> { @refresher.drain('5') }].each do |call|
+      assert_raises(FrozenError) { call.call }
+    end
+  end
+
+  # Fields are read from the struct itself: a redefined reader answers
+  # nothing to the binding and never runs.
+  def test_a_redefined_reader_is_ignored
+    raising = -> { raise 'the binding ran a reader' }
+    lead = R::Lead.new(ID)
+    readers(R::Policy, fresh_for: -> { -1 }, stale_while_revalidate: raising, stale_if_error: raising) do
+      readers(R::Lead, lease: -> { 0 }) do
+        assert_equal :stored, @refresher.put(1, 0, 0, RULES)
+        assert_equal :fresh, RULES.state(9)
+        assert_equal lead, R::Stale.new(1, lead).revalidation
+      end
+    end
+  end
+
+  # A singleton class opened on a genuine value does not change what it is.
+  def test_an_opened_singleton_class_is_still_the_gems_value
+    lease = @refresher.decide(1, 0, 100).lease
+    rules = RULES.clone.tap(&:singleton_class)
+    assert_equal :fresh, rules.state(0)
+    assert_equal :stored, @refresher.store(lease, 1, 0, rules)
+    assert_equal :stored, @refresher.put(2, 1, 0, RULES.dup.tap(&:singleton_class))
+    lead = R::Lead.new(lease).tap(&:singleton_class)
+    assert_equal lead, R::Stale.new(1, lead).revalidation
+  end
+
   # Answers are built natively from what the core returned: no Ruby
   # `initialize` runs, so one that raises cannot lose a lease or a wake-up.
   def test_answers_after_the_core_mutated_run_no_ruby_code
@@ -206,6 +257,18 @@ class ValuesTest < Minitest::Test
   end
 
   private
+
+  # Runs the block with each reader of `value` redefined, then restores it.
+  def readers(value, **bodies)
+    bodies.each_key { |name| value.alias_method(:"__original_#{name}", name) }
+    bodies.each { |name, body| value.define_method(name, &body) }
+    yield
+  ensure
+    bodies.each_key do |name|
+      value.alias_method(name, :"__original_#{name}")
+      value.remove_method(:"__original_#{name}")
+    end
+  end
 
   def poisoned(names)
     saved = names.to_h { [it, R.const_get(it).instance_method(:initialize)] }

@@ -10,11 +10,9 @@ license = "MIT"
 
 [workspace.dependencies]
 refresh-machines = { path = "ext/refresh_machines_native/core" }
-# magnus's "rb-sys" feature is only for `AsRawValue`: the exact-class check
-# compares a value's class with the one resolved at init by identity, which
-# no Ruby method (`==`, `eql?`, `instance_of?`) can be redefined to fake.
-magnus = { version = "0.9.3", default-features = false, features = ["rb-sys"] }
-coalesce-machines = ">=0.7"
+matryona-machines = { version = ">=0.2", default-features = false }
+magnus = { version = "0.9.3", default-features = false }
+coalesce-machines = ">=0.8"
 periscope-machines = ">=0.4"
 rb-sys = { version = "0.9.130", default-features = false, features = ["stable-api-compiled-fallback"] }
 

@@ -11,15 +11,16 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     crate::answers::resolve(ruby, module)?;
     module.define_singleton_method("scope_of", function!(scope_of_id, 1))?;
     // Validation hooks for the Data values; lib/ makes them private.
-    module.define_singleton_method("__nanos", function!(values::nanos, 1))?;
-    module.define_singleton_method("__duration", function!(values::duration, 1))?;
+    module.define_singleton_method("__policy", function!(values::policy, 3))?;
+    module.define_singleton_method("__age", function!(values::age, 1))?;
+    module.define_singleton_method("__until", function!(values::until, 1))?;
     module.define_singleton_method("__lease", function!(values::lease, 1))?;
     module.define_singleton_method("__wait", function!(values::wait, 2))?;
     module.define_singleton_method("__notification", function!(values::notification, 4))?;
     module.define_singleton_method("__refusal", function!(values::refusal, 1))?;
     module.define_singleton_method("__revalidation", function!(values::revalidation, 1))?;
     // Policy is a Data class defined in Ruby; its arithmetic lives here.
-    let policy = crate::answers::classes(ruby)?.policy;
+    let policy = crate::answers::classes(ruby)?.policy.get(ruby);
     policy.define_method("state", method!(policy_state, 1))?;
     policy.define_method("while_revalidate?", method!(policy_while_revalidate, 1))?;
     policy.define_method("if_error?", method!(policy_if_error, 1))?;

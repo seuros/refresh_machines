@@ -2,6 +2,7 @@
 
 use super::{RULES, Small, fetch, revalidation, t, wait};
 use crate::*;
+use matryona_machines::testing::unchanged;
 
 #[test]
 fn a_live_lease_names_the_flight_its_waiters_are_woken_with() {
@@ -13,9 +14,7 @@ fn a_live_lease_names_the_flight_its_waiters_are_woken_with() {
     assert_ne!(refresher.flight(other), Some(flight));
     let waiter = wait(&mut refresher, 42, 1);
     // Asking is pure.
-    let before = refresher.clone();
-    assert_eq!(refresher.flight(lease), Some(flight));
-    assert_eq!(refresher, before);
+    assert_eq!(unchanged(&mut refresher, |r| r.flight(lease)), Some(flight));
 
     assert_eq!(refresher.store(lease, t(2), t(0), RULES), Ok(()));
     let mut out = [Notification::default(); 2];

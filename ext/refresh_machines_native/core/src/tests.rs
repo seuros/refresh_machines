@@ -3,6 +3,7 @@ extern crate std;
 
 use super::*;
 use core::assert_matches;
+use matryona_machines::testing::{refuses, unchanged};
 
 mod flight;
 mod limits;
@@ -337,38 +338,37 @@ fn capacity_refusals_change_nothing() {
     let mut refresher = Small::new();
     let one = fetch(&mut refresher, 1, 0);
     let two = fetch(&mut refresher, 2, 0);
-    let before = refresher.clone();
-    assert_eq!(refresher.decide(3, t(0), t(100)), Err(Refusal::FlightsFull));
-    assert_eq!(refresher, before);
+    refuses(&mut refresher, Refusal::FlightsFull, |r| {
+        r.decide(3, t(0), t(100))
+    });
 
     for _ in 0..3 {
         wait(&mut refresher, 1, 0);
     }
-    let before = refresher.clone();
-    assert_eq!(refresher.decide(2, t(5), t(100)), Err(Refusal::WaitersFull));
-    assert_eq!(refresher.decide(1, t(5), t(0)), Err(Refusal::ZeroLead));
-    assert_eq!(refresher, before);
+    refuses(&mut refresher, Refusal::WaitersFull, |r| {
+        r.decide(2, t(5), t(100))
+    });
+    refuses(&mut refresher, Refusal::ZeroLead, |r| {
+        r.decide(1, t(5), t(0))
+    });
     assert_eq!(refresher.now(), t(0));
 
     assert_eq!(refresher.store(one, t(0), t(0), RULES), Ok(()));
     assert_eq!(refresher.put(8, t(0), t(0), RULES), Ok(()));
     assert_eq!(refresher.put(9, t(0), t(0), RULES), Ok(()));
     assert_eq!((refresher.len(), refresher.capacity()), (3, 3));
-    let before = refresher.clone();
-    assert_eq!(
-        refresher.put(10, t(0), t(0), RULES),
-        Err(Refusal::EntriesFull)
-    );
-    assert_eq!(
-        refresher.store(two, t(0), t(0), RULES),
-        Err(Refusal::EntriesFull)
-    );
-    assert_eq!(refresher, before);
+    refuses(&mut refresher, Refusal::EntriesFull, |r| {
+        r.put(10, t(0), t(0), RULES)
+    });
+    refuses(&mut refresher, Refusal::EntriesFull, |r| {
+        r.store(two, t(0), t(0), RULES)
+    });
     // The lease survived the refusal: make room and report again.
     assert_eq!(refresher.forget(9), Forgetting::Forgotten);
-    let before = refresher.clone();
-    assert_eq!(refresher.forget(9), Forgetting::NotHeld);
-    assert_eq!(refresher, before);
+    assert_eq!(
+        unchanged(&mut refresher, |r| r.forget(9)),
+        Forgetting::NotHeld
+    );
     assert_eq!(refresher.store(two, t(0), t(0), RULES), Ok(()));
     // Replacing a known key needs no free slot.
     assert_eq!(refresher.put(8, t(0), t(3), RULES), Ok(()));
@@ -388,12 +388,10 @@ fn stale_value_is_still_served_when_the_revalidation_cannot_be_registered() {
     assert_eq!(refresher.now(), t(11));
     // Honoured, yet the registration that failed left nothing behind: with the
     // clock already there, the same answer leaves the whole value as it was.
-    let before = refresher.clone();
     assert_eq!(
-        revalidation(refresher.decide(7, t(11), t(100))),
+        revalidation(unchanged(&mut refresher, |r| r.decide(7, t(11), t(100)))),
         (t(11), Revalidation::Unavailable(Refusal::FlightsFull))
     );
-    assert_eq!(refresher, before);
     // Past the window there is nothing to serve, so the refusal is the answer.
     assert_eq!(
         refresher.decide(7, t(15), t(100)),
@@ -406,28 +404,17 @@ fn stale_value_is_still_served_when_the_revalidation_cannot_be_registered() {
 fn time_regression_is_refused_everywhere_and_changes_nothing() {
     let mut refresher = Small::new();
     let lease = fetch(&mut refresher, 1, 10);
-    let before = refresher.clone();
     let mut out = [77; 2];
-    assert_eq!(
-        refresher.decide(1, t(9), t(100)),
-        Err(Refusal::TimeRegressed)
-    );
-    assert_eq!(
-        refresher.store(lease, t(9), t(0), RULES),
-        Err(Refusal::TimeRegressed)
-    );
-    assert_eq!(
-        refresher.fail(lease, t(9), t(0)),
-        Err(Refusal::TimeRegressed)
-    );
-    assert_eq!(
-        refresher.put(2, t(9), t(0), RULES),
-        Err(Refusal::TimeRegressed)
-    );
-    assert_eq!(refresher.reap(t(9)), Err(Refusal::TimeRegressed));
-    assert_eq!(refresher.sweep(t(9), &mut out), Err(Refusal::TimeRegressed));
+    let regressed = Refusal::TimeRegressed;
+    refuses(&mut refresher, regressed, |r| r.decide(1, t(9), t(100)));
+    refuses(&mut refresher, regressed, |r| {
+        r.store(lease, t(9), t(0), RULES)
+    });
+    refuses(&mut refresher, regressed, |r| r.fail(lease, t(9), t(0)));
+    refuses(&mut refresher, regressed, |r| r.put(2, t(9), t(0), RULES));
+    refuses(&mut refresher, regressed, |r| r.reap(t(9)));
+    refuses(&mut refresher, regressed, |r| r.sweep(t(9), &mut out));
     assert_eq!(out, [77; 2]);
-    assert_eq!(refresher, before);
     assert_eq!(refresher.store(lease, t(10), t(0), RULES), Ok(()));
     // Queries are pure: an earlier time reads the age the value was stored with.
     assert_eq!(refresher.age(1, t(3)), Some(t(0)));

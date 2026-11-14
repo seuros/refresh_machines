@@ -1,8 +1,9 @@
 //! One sequence per refresher: a lease, a waiter id and a flight id are never
 //! equal, and a restart resumes the sequence instead of starting it again.
+use matryona_machines::testing::refuses;
 use periscope_machines::{SEQUENCE_MAX, scoped};
 
-use super::model::{Rng, scope_for};
+use super::model::{Draws, scope_for, seeded};
 use super::std::collections::BTreeSet;
 use super::std::vec::Vec;
 use super::{As, Small, fetch, lease_of, names_nothing, t, wait, waiter_of};
@@ -24,13 +25,12 @@ fn regression_a_lease_and_a_waiter_id_never_name_each_other() {
     );
     assert_ne!(l2.raw(), waiter.raw());
 
-    let before = refresher.clone();
-    assert_eq!(refresher.cancel(waiter_of(l2.raw())), Err(Refusal::Stale));
-    assert_eq!(
-        refresher.abandon(lease_of(waiter.raw())),
-        Err(Refusal::Stale)
-    );
-    assert_eq!(refresher, before);
+    refuses(&mut refresher, Refusal::Stale, |r| {
+        r.cancel(waiter_of(l2.raw()))
+    });
+    refuses(&mut refresher, Refusal::Stale, |r| {
+        r.abandon(lease_of(waiter.raw()))
+    });
 
     // No id of one kind works as another, through any method.
     let flights = [l1, l2].map(|lease| refresher.flight(lease).expect("live"));
@@ -53,7 +53,7 @@ fn regression_a_lease_and_a_waiter_id_never_name_each_other() {
 fn no_lease_ever_equals_a_waiter_or_flight_id_live_or_past() {
     type Core = Refresher<3, 3, 4>;
     for seed in 1..=24_u64 {
-        let mut rng = Rng::seeded(seed);
+        let mut rng = seeded(seed);
         let scope = scope_for(seed, 11);
         let mut refresher = Core::with_scope(scope);
         let (mut leases, mut others) = (BTreeSet::new(), BTreeSet::new());

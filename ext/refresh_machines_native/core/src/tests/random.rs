@@ -215,7 +215,7 @@ fn sweep(rng: &mut Rng, refresher: &mut Core, model: &mut Model, d: &Draw) {
 fn cancel(rng: &mut Rng, refresher: &mut Core, model: &mut Model) {
     let live: Vec<u64> = model.flying.values().map(|f| f.lease).collect();
     let waiter = if model.seen.is_empty() || rng.below(5) == 0 {
-        waiter_of(rng.next() | 1)
+        waiter_of(rng.next_u64() | 1)
     } else if !live.is_empty() && rng.below(4) == 0 {
         // A live lease, or the flight it rides on, rebuilt as a waiter id.
         let lease = rng.pick(&live);
@@ -284,7 +284,7 @@ fn reorder(refresher: &Core, model: &mut Model, before: usize) {
 #[test]
 fn random_operations_agree_with_a_naive_model() {
     for seed in 1..=40_u64 {
-        let mut rng = Rng::seeded(seed);
+        let mut rng = seeded(seed);
         let scope = scope_for(seed, 7);
         let mut refresher = Refresher::<KEYS, FLIGHTS, WAITERS>::with_scope(scope);
         assert_eq!(refresher.scope(), scope);

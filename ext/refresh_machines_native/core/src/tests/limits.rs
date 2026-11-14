@@ -1,4 +1,5 @@
 //! The ends of time, of the id space and of zero-sized tables.
+use matryona_machines::testing::refuses;
 use periscope_machines::SEQUENCE_MAX;
 
 use super::{MAX, NEAR, RULES, Small, fetch, lease_of, near_the_end, revalidation, std, t};
@@ -51,10 +52,11 @@ fn a_spent_id_space_refuses_without_mutating() {
     assert_eq!(refresher.issued(), SEQUENCE_MAX);
     let before = refresher.clone();
     // A new key, the takeover of an overdue lease and a wait all need an id.
-    assert_eq!(refresher.decide(3, t(20), t(100)), Err(Refusal::Exhausted));
-    assert_eq!(refresher.decide(2, t(20), t(100)), Err(Refusal::Exhausted));
-    assert_eq!(refresher.decide(2, t(0), t(100)), Err(Refusal::Exhausted));
-    assert_eq!(refresher, before);
+    for (key, now) in [(3, 20), (2, 20), (2, 0)] {
+        refuses(&mut refresher, Refusal::Exhausted, |r| {
+            r.decide(key, t(now), t(100))
+        });
+    }
     // A servable stale value is still served; only its refresh is unavailable.
     assert_eq!(
         revalidation(refresher.decide(1, t(12), t(100))),
@@ -85,24 +87,24 @@ fn full_refresh_slots_are_reported_before_a_spent_id_space() {
     assert_eq!(refresher.put(1, t(0), t(0), RULES), Ok(()));
     let first = fetch(&mut refresher, 2, 0);
     fetch(&mut refresher, 3, 0);
-    let before = refresher.clone();
     // No refresh slot and no id: the full table is what the caller hears,
     // as it is from the coalescer, where the sequence is checked last.
-    assert_eq!(refresher.decide(4, t(0), t(100)), Err(Refusal::FlightsFull));
-    assert_eq!(refresher, before);
+    refuses(&mut refresher, Refusal::FlightsFull, |r| {
+        r.decide(4, t(0), t(100))
+    });
     assert_eq!(
         revalidation(refresher.decide(1, t(12), t(100))),
         (t(12), Revalidation::Unavailable(Refusal::FlightsFull))
     );
     // Waiting takes an id from the same sequence, so it is refused too.
-    let before = refresher.clone();
-    assert_eq!(refresher.decide(2, t(12), t(100)), Err(Refusal::Exhausted));
+    refuses(&mut refresher, Refusal::Exhausted, |r| {
+        r.decide(2, t(12), t(100))
+    });
     // With a slot free again, the spent sequence is what is left to report.
-    assert_eq!(refresher, before);
     assert_eq!(refresher.abandon(first), Ok(()));
-    let before = refresher.clone();
-    assert_eq!(refresher.decide(4, t(12), t(100)), Err(Refusal::Exhausted));
-    assert_eq!(refresher, before);
+    refuses(&mut refresher, Refusal::Exhausted, |r| {
+        r.decide(4, t(12), t(100))
+    });
     assert_eq!(
         revalidation(refresher.decide(1, t(12), t(100))),
         (t(12), Revalidation::Unavailable(Refusal::Exhausted))
@@ -117,9 +119,9 @@ fn a_new_refresh_needs_two_ids_and_takes_neither_when_one_is_left() {
     };
     assert_eq!(refresher.issued(), SEQUENCE_MAX - 1);
     // One id left, a refresh slot free: a lease without a flight is no refresh.
-    let before = refresher.clone();
-    assert_eq!(refresher.decide(2, t(0), t(100)), Err(Refusal::Exhausted));
-    assert_eq!(refresher, before);
+    refuses(&mut refresher, Refusal::Exhausted, |r| {
+        r.decide(2, t(0), t(100))
+    });
     // The id was not consumed: a takeover, which needs only a lease, gets it.
     let heir = fetch(&mut refresher, 1, 5);
     assert_eq!(heir.raw(), periscope_machines::scoped(5, SEQUENCE_MAX));
@@ -128,10 +130,12 @@ fn a_new_refresh_needs_two_ids_and_takes_neither_when_one_is_left() {
         Some(overdue.raw() + 1)
     );
     assert_eq!(refresher.issued(), SEQUENCE_MAX);
-    let before = refresher.clone();
-    assert_eq!(refresher.decide(1, t(5), t(100)), Err(Refusal::Exhausted));
-    assert_eq!(refresher.decide(1, t(200), t(100)), Err(Refusal::Exhausted));
-    assert_eq!(refresher, before);
+    refuses(&mut refresher, Refusal::Exhausted, |r| {
+        r.decide(1, t(5), t(100))
+    });
+    refuses(&mut refresher, Refusal::Exhausted, |r| {
+        r.decide(1, t(200), t(100))
+    });
 }
 
 #[test]
