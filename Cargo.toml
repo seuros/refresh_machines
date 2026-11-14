@@ -10,7 +10,7 @@ license = "MIT"
 
 [workspace.dependencies]
 refresh-machines = { path = "ext/refresh_machines_native/core" }
-matryona-machines = { version = ">=0.2", default-features = false }
+matryona-machines = { version = ">=0.3", default-features = false }
 magnus = { version = "0.9.3", default-features = false }
 coalesce-machines = ">=0.8"
 periscope-machines = ">=0.4"

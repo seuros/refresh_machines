@@ -2,7 +2,7 @@
 //! core accepts, whether the gem built it or the caller did.
 
 use magnus::{Error, Ruby, Symbol, Value};
-use matryona_machines::ruby::{Symbols, duration, exact_fields, instance_of, instant, integer};
+use matryona_machines::ruby::{Symbols, duration, exact_fields, instant, integer, which};
 use refresh_machines::{Decision, FlightId, Lease, Notification, WaiterId};
 
 use crate::Refusals;
@@ -72,6 +72,8 @@ pub fn refusal(ruby: &Ruby, value: Value) -> Result<Value, Error> {
     Refusals::parse(ruby, value).map(|_| value)
 }
 
+const NOT_ONE: &str = "revalidation must be a Lead, :in_flight, a Backoff or an Unavailable";
+
 /// `__revalidation`: what a `Stale#revalidation` may hold, read natively
 /// because `case`/`===` takes a subclass: `:in_flight`, or exactly a `Lead`,
 /// `Backoff` or `Unavailable` whose fields are checked again (`Marshal.load`
@@ -89,28 +91,21 @@ pub fn revalidation(ruby: &Ruby, value: Value) -> Result<Value, Error> {
         ));
     }
     let classes = classes(ruby)?;
-    let (lead, backoff) = (classes.lead.get(ruby), classes.backoff.get(ruby));
-    let unavailable = classes.unavailable.get(ruby);
-    if instance_of(value, lead) {
-        let [lease] = exact_fields(ruby, value, lead, "expected a RefreshMachines::Lead")?;
-        self::lease(ruby, lease)?;
-    } else if instance_of(value, backoff) {
-        let [until] = exact_fields(ruby, value, backoff, "expected a RefreshMachines::Backoff")?;
-        self::until(until)?;
-    } else if instance_of(value, unavailable) {
-        let [refused] = exact_fields(
-            ruby,
-            value,
-            unavailable,
-            "expected a RefreshMachines::Unavailable",
-        )?;
-        refusal(ruby, refused)?;
-    } else {
-        return Err(Error::new(
-            ruby.exception_type_error(),
-            "revalidation must be a Lead, :in_flight, a Backoff or an Unavailable",
-        ));
-    }
+    let one_of = [
+        classes.lead.get(ruby),
+        classes.backoff.get(ruby),
+        classes.unavailable.get(ruby),
+    ];
+    let Some(index) = which(value, &one_of) else {
+        return Err(Error::new(ruby.exception_type_error(), NOT_ONE));
+    };
+    // Each class has one member; `which` chose the class it is exactly.
+    let [field] = exact_fields(ruby, value, one_of[index], NOT_ONE)?;
+    match index {
+        0 => self::lease(ruby, field).map(drop),
+        1 => self::until(field),
+        _ => refusal(ruby, field).map(drop),
+    }?;
     Ok(value)
 }
 
