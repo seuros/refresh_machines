@@ -13,11 +13,11 @@ module RefreshMachines
   # Every instant and span in this gem is Integer nanoseconds: `now` as read
   # from `Process.clock_gettime(Process::CLOCK_MONOTONIC, :nanosecond)`, and
   # every age, window, `lead_for`, `retry_after` and `Backoff#until`.
-  # Span arguments, and the Policy windows, are in 0..2**64-1; `now` is in
-  # 0..`Duration::MAX`, so every instant the refresher answers reads back as
-  # `now`. An age or instant the core answers (Fresh, Stale, Backoff) may be
-  # past 2**64-1, up to `Duration::MAX`, because sums saturate instead of
-  # wrapping.
+  # `now` and age arguments are in 0..`Duration::MAX`, so every instant and
+  # age the refresher answers reads back; the other span arguments, and the
+  # Policy windows, are in 0..2**64-1. An age or instant the core answers
+  # (Fresh, Stale, Backoff, `fail`, `age`) may be past 2**64-1, up to
+  # `Duration::MAX`, because sums saturate instead of wrapping.
   Policy = Data.define(:fresh_for, :stale_while_revalidate, :stale_if_error) do
     def initialize(fresh_for:, stale_while_revalidate:, stale_if_error:)
       RefreshMachines.__send__(:__policy, fresh_for, stale_while_revalidate, stale_if_error)

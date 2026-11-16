@@ -73,6 +73,25 @@ class RefresherTest < Minitest::Test
     assert_raises(RangeError) { @refresher.decide(1, DURATION_MAX, 2**64) }
   end
 
+  # Bug: an age the refresher answered past 2**64-1 (here 2 * MAX) raised
+  # RangeError when handed back to `put`, `store` or a Policy query.
+  def test_every_returned_age_reads_back_as_an_age
+    @refresher.put(1, 0, MAX, R::Policy.new(MAX, MAX, MAX))
+    age = @refresher.age(1, MAX)
+    assert_equal 2 * MAX, age
+    assert_equal [:expired, false, false], [RULES.state(age), RULES.while_revalidate?(age), RULES.if_error?(age)]
+    assert_equal :stored, @refresher.put(2, MAX, age, RULES)
+    assert_equal [age, :expired], [@refresher.age(2, MAX), @refresher.state(2, MAX)]
+    fetch = @refresher.decide(3, MAX, 1)
+    assert_equal :stored, @refresher.store(fetch.lease, MAX, age, RULES)
+    assert_equal age, @refresher.age(3, MAX)
+    assert_equal :stored, @refresher.put(4, MAX, DURATION_MAX, RULES)
+    assert_equal DURATION_MAX, @refresher.age(4, DURATION_MAX)
+    assert_raises(RangeError) { @refresher.put(5, MAX, DURATION_MAX + 1, RULES) }
+    assert_raises(RangeError) { RULES.state(DURATION_MAX + 1) }
+    assert_nil @refresher.age(5, MAX)
+  end
+
   def test_miss_is_fetched_once_and_waiters_are_woken
     fetch = @refresher.decide(42, 0, 100)
     assert_equal R::Fetch.new(fetch.lease), fetch

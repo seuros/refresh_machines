@@ -88,17 +88,17 @@ fn state_name(ruby: &Ruby, state: State) -> Symbol {
 }
 
 fn policy_state(ruby: &Ruby, this: Value, age: Value) -> Result<Symbol, Error> {
-    let age = duration(age, "age")?;
+    let age = instant(age, "age")?;
     Ok(state_name(ruby, Rules::try_convert(this)?.0.state(age)))
 }
 
 fn policy_while_revalidate(this: Value, age: Value) -> Result<bool, Error> {
-    let age = duration(age, "age")?;
+    let age = instant(age, "age")?;
     Ok(Rules::try_convert(this)?.0.while_revalidate(age))
 }
 
 fn policy_if_error(this: Value, age: Value) -> Result<bool, Error> {
-    let age = duration(age, "age")?;
+    let age = instant(age, "age")?;
     Ok(Rules::try_convert(this)?.0.if_error(age))
 }
 
@@ -178,7 +178,7 @@ impl Refresher {
     ) -> Result<Value, Error> {
         this.check_frozen()?;
         let (lease, now) = (integer(lease, "lease")?, instant(now, "now")?);
-        let (age, policy) = (duration(age, "age")?, Rules::try_convert(policy)?.0);
+        let (age, policy) = (instant(age, "age")?, Rules::try_convert(policy)?.0);
         let lease = lease_id(ruby, lease)?;
         let outcome = this.core.borrow_mut().store(lease, now, age, policy);
         Ok(done(ruby, outcome, "stored"))
@@ -231,7 +231,7 @@ impl Refresher {
     ) -> Result<Value, Error> {
         this.check_frozen()?;
         let (key, now) = (integer(key, "key")?, instant(now, "now")?);
-        let (age, policy) = (duration(age, "age")?, Rules::try_convert(policy)?.0);
+        let (age, policy) = (instant(age, "age")?, Rules::try_convert(policy)?.0);
         let outcome = this.core.borrow_mut().put(key, now, age, policy);
         Ok(done(ruby, outcome, "stored"))
     }
