@@ -1,8 +1,10 @@
 //! Private hooks that hold every `RefreshMachines` Data value to what the
 //! core accepts, whether the gem built it or the caller did.
 
-use magnus::{Error, Ruby, Value};
-use matryona_machines::ruby::{Choice, Symbols, duration, instant, integer, symbol_or_fields};
+use magnus::{Error, Ruby, Value, value::ReprValue};
+use matryona_machines::ruby::{
+    Choice, Refused, Symbols, duration, instant, integer, symbol_or_fields_why,
+};
 use refresh_machines::{Decision, FlightId, Lease, Notification, WaiterId};
 
 use crate::Refusals;
@@ -77,8 +79,8 @@ const NOT_ONE: &str = "revalidation must be a Lead, :in_flight, a Backoff or an 
 /// `__revalidation`: what a `Stale#revalidation` may hold, read natively
 /// because `case`/`===` takes a subclass: `:in_flight`, or exactly a `Lead`,
 /// `Backoff` or `Unavailable` whose fields are checked again (`Marshal.load`
-/// skips `initialize`). `RangeError` for another Symbol, `TypeError` for
-/// anything else.
+/// skips `initialize`). `RangeError` naming any other Symbol (`unknown
+/// revalidation :nope`), `TypeError` for anything else.
 pub fn revalidation(ruby: &Ruby, value: Value) -> Result<Value, Error> {
     let classes = classes(ruby)?;
     let one_of = [
@@ -87,7 +89,11 @@ pub fn revalidation(ruby: &Ruby, value: Value) -> Result<Value, Error> {
         classes.unavailable.get(ruby),
     ];
     // Each class has one member, read from the struct.
-    match symbol_or_fields(ruby, value, Revalidations, &one_of, NOT_ONE)? {
+    let read = symbol_or_fields_why(ruby, value, Revalidations, &one_of, |why| match why {
+        Refused::UnknownSymbol(symbol) => format!("unknown revalidation {}", symbol.inspect()),
+        _ => NOT_ONE.into(),
+    })?;
+    match read {
         Choice::Symbol(_) => Ok(()),
         Choice::Struct(0, [field]) => self::lease(ruby, field).map(drop),
         Choice::Struct(1, [field]) => self::until(field),

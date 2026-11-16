@@ -61,11 +61,11 @@ class ValuesTest < Minitest::Test
   end
 
   # Any Symbol but :in_flight, a data variant's name included, is refused
-  # with the same message as a value of the wrong class.
+  # by name; a value of the wrong class hears what a revalidation may hold.
   def test_a_refused_revalidation_names_what_it_may_hold
     message = 'revalidation must be a Lead, :in_flight, a Backoff or an Unavailable'
     %i[nope lead backoff unavailable].each do |name|
-      assert_equal message, assert_raises(RangeError) { R::Stale.new(1, name) }.message
+      assert_equal "unknown revalidation :#{name}", assert_raises(RangeError) { R::Stale.new(1, name) }.message
     end
     assert_equal message, assert_raises(TypeError) { R::Stale.new(1, ID) }.message
   end
@@ -268,24 +268,35 @@ class ValuesTest < Minitest::Test
 
   private
 
-  # Runs the block with each reader of `value` redefined, then restores it.
+  # Runs the block with each method of `value` named in `bodies` replaced by
+  # its body, then restores the originals.
   def readers(value, **bodies)
-    bodies.each_key { |name| value.alias_method(:"__original_#{name}", name) }
-    bodies.each { |name, body| value.define_method(name, &body) }
+    originals = bodies.to_h { |name, _| [name, value.instance_method(name)] }
+    bodies.each { |name, body| replace_method(value, name, body) }
     yield
   ensure
-    bodies.each_key do |name|
-      value.alias_method(name, :"__original_#{name}")
-      value.remove_method(:"__original_#{name}")
-    end
+    originals&.each { |name, method| replace_method(value, name, (method if method.owner == value)) }
   end
 
-  def poisoned(names)
-    saved = names.to_h { [it, R.const_get(it).instance_method(:initialize)] }
-    saved.each_key { R.const_get(it).define_method(:initialize) { |*, **| raise 'Ruby code ran' } }
-    yield
+  # Defines `name` on `klass` as `body` (removes it when `body` is nil),
+  # removing the method `klass` itself holds first. Ruby warns about the
+  # redefinition (and about removing `initialize`), deliberate here, so
+  # warnings are off for the swap alone.
+  def replace_method(klass, name, body)
+    verbose = $VERBOSE
+    $VERBOSE = nil
+    klass.remove_method(name) if klass.method_defined?(name, false) || klass.private_method_defined?(name, false)
+    klass.define_method(name, body) if body
   ensure
-    saved.each { |name, method| R.const_get(name).define_method(:initialize, method) }
+    $VERBOSE = verbose
+  end
+
+  # Runs the block with `initialize` of each named value raising.
+  def poisoned(names, &block)
+    return yield if names.empty?
+
+    first, *rest = names
+    readers(R.const_get(first), initialize: proc { |*, **| raise 'Ruby code ran' }) { poisoned(rest, &block) }
   end
 
   def without(name)

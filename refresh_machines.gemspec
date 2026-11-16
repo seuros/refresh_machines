@@ -6,8 +6,9 @@ Gem::Specification.new do |spec|
   spec.version = RefreshMachines::VERSION
   spec.authors = ['Abdelkader Boudih']
   spec.email = ['oss@seuros.com']
-  spec.summary = 'Initial stale-while-revalidate and stale-if-error decisions with a native Rust core'
-  spec.description = 'Local unstable freshness and refresh-lease policy; stores no values, fetches and evicts nothing.'
+  spec.summary = 'Stale-while-revalidate and stale-if-error decisions for Ruby'
+  spec.description = 'Classifies cached values as fresh, stale or expired and grants one refresh lease per key. ' \
+                     'Stores no values, fetches nothing and evicts nothing.'
   spec.homepage = 'https://github.com/seuros/refresh_machines'
   spec.license = 'MIT'
   spec.required_ruby_version = '>= 4.0.0'

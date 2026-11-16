@@ -2,7 +2,7 @@
 
 use core::time::Duration;
 
-use coalesce_machines::{FlightId, Joined, Outcome, WaiterId};
+use coalesce_machines::{Coalescer, FlightId, Joined, Outcome, WaiterId};
 
 use crate::{Lead, Lease, Refresher, Refusal};
 
@@ -21,38 +21,35 @@ impl<const KEYS: usize, const FLIGHTS: usize, const WAITERS: usize>
         lead_for: Duration,
     ) -> Result<Lease, Refusal> {
         let deadline = now.saturating_add(lead_for);
-        if let Some(lead) = self
-            .lead_slot(key)
-            .and_then(|slot| self.leads[slot].as_mut())
-        {
+        let Self { leads, flights, .. } = self;
+        if let Some(lead) = leads.iter_mut().flatten().find(|lead| lead.key == key) {
             // A takeover: a new lease on the flight already in the air.
-            let lease = self.flights.reserve()?;
+            let lease = flights.reserve()?;
             lead.lease = lease;
             lead.deadline = deadline;
             return Ok(Lease(lease));
         }
-        let slot = self
-            .leads
-            .iter()
-            .position(Option::is_none)
+        let free = leads
+            .iter_mut()
+            .find(|lead| lead.is_none())
             .ok_or(Refusal::FlightsFull)?;
-        if self.flights.flight(key).is_some() {
+        if flights.flight(key).is_some() {
             debug_assert!(false, "every coalesce flight has a lead");
             return Err(Refusal::Stale);
         }
-        if self.flights.in_flight() == FLIGHTS {
+        if flights.in_flight() == FLIGHTS {
             debug_assert!(false, "a free lead slot means a free flight slot");
             return Err(Refusal::FlightsFull);
         }
         // A lease and a flight: with one id left, neither is drawn.
-        if self.flights.remaining() < 2 {
+        if flights.remaining() < 2 {
             return Err(Refusal::Exhausted);
         }
         // The key has no flight, so the join leads; the snapshot only serves
         // the arm the type demands, to leave nothing changed if it is reached.
-        let before = self.flights.clone();
-        let lease = self.flights.reserve()?;
-        let flight = match self.flights.join(key) {
+        let before = flights.clone();
+        let lease = flights.reserve()?;
+        let flight = match flights.join(key) {
             Ok(Joined::Leader(flight)) => flight,
             Ok(Joined::Follower { .. })
             | Err(
@@ -65,11 +62,11 @@ impl<const KEYS: usize, const FLIGHTS: usize, const WAITERS: usize>
                     false,
                     "a key with no flight leads, with ids and a slot to spare"
                 );
-                self.flights = before;
+                *flights = before;
                 return Err(Refusal::Stale);
             }
         };
-        self.leads[slot] = Some(Lead {
+        *free = Some(Lead {
             lease,
             key,
             flight,
@@ -97,24 +94,24 @@ impl<const KEYS: usize, const FLIGHTS: usize, const WAITERS: usize>
         }
     }
 
-    /// Settle the flight of the lead in `slot` and free the slot.
+    /// Settle the flight of the lead held in `slot` and free the slot.
     ///
     /// Every lead's flight is in the air, so the coalescer never refuses; if
     /// it did, it changed nothing and neither does this: the slot is freed
     /// only once the flight has settled.
     pub(crate) fn settle(
-        &mut self,
-        slot: usize,
+        flights: &mut Coalescer<FLIGHTS, WAITERS>,
+        slot: &mut Option<Lead>,
         flight: FlightId,
         outcome: Outcome,
     ) -> Result<(), Refusal> {
         let settled = match outcome {
-            Outcome::Completed => self.flights.complete(flight),
-            Outcome::Abandoned => self.flights.abandon(flight),
+            Outcome::Completed => flights.complete(flight),
+            Outcome::Abandoned => flights.abandon(flight),
         };
         match settled {
             Ok(_) => {
-                self.leads[slot] = None;
+                *slot = None;
                 Ok(())
             }
             Err(refusal) => {

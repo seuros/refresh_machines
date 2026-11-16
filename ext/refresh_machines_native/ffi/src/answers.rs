@@ -8,7 +8,7 @@
 //! calls build on a copy of the refresher kept only once the answer exists.
 
 use magnus::{Error, IntoValue, RClass, RModule, RStruct, Ruby, TryConvert, Value, prelude::*};
-use matryona_machines::ruby::{Class, Registry, SymbolNames, Symbols, nanoseconds};
+use matryona_machines::ruby::{Class, SymbolNames, Symbols, nanoseconds};
 use refresh_machines::{Decision, Notification, Outcome, Revalidation};
 
 use crate::refusal;
@@ -26,7 +26,10 @@ pub struct Classes {
     pub notification: Class,
 }
 
-static CLASSES: Registry<Classes> = Registry::new("refresh_machines");
+matryona_machines::registry! {
+    static CLASSES: Classes = "refresh_machines";
+    pub fn classes;
+}
 
 pub fn resolve(ruby: &Ruby, module: RModule) -> Result<(), Error> {
     let class = |name| Class::resolve(ruby, module, name);
@@ -42,10 +45,6 @@ pub fn resolve(ruby: &Ruby, module: RModule) -> Result<(), Error> {
         notification: class("Notification")?,
     };
     CLASSES.set(ruby, classes).map(drop)
-}
-
-pub fn classes(ruby: &Ruby) -> Result<&'static Classes, Error> {
-    CLASSES.get(ruby)
 }
 
 /// A frozen instance of `class` holding `members`, in order.

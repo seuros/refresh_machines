@@ -1,5 +1,6 @@
 #![no_std]
 #![doc = include_str!("../README.md")]
+#![cfg_attr(not(test), deny(clippy::indexing_slicing))]
 
 use core::time::Duration;
 
@@ -159,13 +160,9 @@ impl<const KEYS: usize, const FLIGHTS: usize, const WAITERS: usize>
         if lead_for.is_zero() {
             return Err(Refusal::ZeroLead);
         }
-        let live = self
-            .lead_slot(key)
-            .and_then(|slot| self.leads[slot])
-            .is_some_and(|lead| now < lead.deadline);
+        let live = self.lead_of(key).is_some_and(|lead| now < lead.deadline);
         let held = self
-            .entry_slot(key)
-            .and_then(|slot| self.entries[slot])
+            .entry(key)
             .map(|entry| (entry.age_at(now), entry.policy, entry.retry_at));
         let decision = match held {
             Some((age, policy, _)) if policy.state(age) == State::Fresh => Decision::Fresh { age },
@@ -214,10 +211,16 @@ impl<const KEYS: usize, const FLIGHTS: usize, const WAITERS: usize>
         policy: Policy,
     ) -> Result<(), Refusal> {
         self.check(now)?;
-        let (slot, lead) = self.held(lease).ok_or(Refusal::Stale)?;
-        let home = self.room_for(lead.key).ok_or(Refusal::EntriesFull)?;
-        self.settle(slot, lead.flight, Outcome::Completed)?;
-        self.entries[home] = Some(Entry::new(lead.key, now, age, policy));
+        let Self {
+            entries,
+            leads,
+            flights,
+            ..
+        } = self;
+        let (lead, slot) = Self::held_in(leads, flights, lease).ok_or(Refusal::Stale)?;
+        let home = Self::room_in(entries, lead.key).ok_or(Refusal::EntriesFull)?;
+        Self::settle(flights, slot, lead.flight, Outcome::Completed)?;
+        *home = Some(Entry::new(lead.key, now, age, policy));
         self.now = now;
         Ok(())
     }
@@ -240,12 +243,15 @@ impl<const KEYS: usize, const FLIGHTS: usize, const WAITERS: usize>
         retry_after: Duration,
     ) -> Result<Option<Duration>, Refusal> {
         self.check(now)?;
-        let (slot, lead) = self.held(lease).ok_or(Refusal::Stale)?;
-        self.settle(slot, lead.flight, Outcome::Abandoned)?;
+        let (lead, slot) =
+            Self::held_in(&mut self.leads, &self.flights, lease).ok_or(Refusal::Stale)?;
+        Self::settle(&mut self.flights, slot, lead.flight, Outcome::Abandoned)?;
         self.now = now;
         let Some(entry) = self
-            .entry_slot(lead.key)
-            .and_then(|home| self.entries[home].as_mut())
+            .entries
+            .iter_mut()
+            .flatten()
+            .find(|entry| entry.key == lead.key)
         else {
             return Ok(None);
         };
@@ -263,9 +269,9 @@ impl<const KEYS: usize, const FLIGHTS: usize, const WAITERS: usize>
     ///
     /// [`Refusal::Stale`] when the lease is not live. Nothing changes.
     pub fn abandon(&mut self, lease: Lease) -> Result<(), Refusal> {
-        let (slot, lead) = self.held(lease).ok_or(Refusal::Stale)?;
-        self.settle(slot, lead.flight, Outcome::Abandoned)?;
-        Ok(())
+        let (lead, slot) =
+            Self::held_in(&mut self.leads, &self.flights, lease).ok_or(Refusal::Stale)?;
+        Self::settle(&mut self.flights, slot, lead.flight, Outcome::Abandoned)
     }
 
     /// Revoke every lease whose deadline has passed, and return how many.
@@ -281,13 +287,14 @@ impl<const KEYS: usize, const FLIGHTS: usize, const WAITERS: usize>
         self.check(now)?;
         self.now = now;
         let mut revoked = 0;
-        for slot in 0..FLIGHTS {
-            let Some(lead) = self.leads[slot].filter(|lead| now >= lead.deadline) else {
+        for slot in &mut self.leads {
+            let Some(lead) = slot.filter(|lead| now >= lead.deadline) else {
                 continue;
             };
             // A lead whose flight is not in the air stays put rather than
             // vanish uncounted; `settle` flags the broken invariant.
-            if self.settle(slot, lead.flight, Outcome::Abandoned).is_ok() {
+            if Self::settle(&mut self.flights, slot, lead.flight, Outcome::Abandoned).is_ok() {
+                // At most one per lead slot, so it cannot pass `FLIGHTS`.
                 revoked += 1;
             }
         }
@@ -311,8 +318,8 @@ impl<const KEYS: usize, const FLIGHTS: usize, const WAITERS: usize>
         policy: Policy,
     ) -> Result<(), Refusal> {
         self.check(now)?;
-        let home = self.room_for(key).ok_or(Refusal::EntriesFull)?;
-        self.entries[home] = Some(Entry::new(key, now, age, policy));
+        let home = Self::room_in(&mut self.entries, key).ok_or(Refusal::EntriesFull)?;
+        *home = Some(Entry::new(key, now, age, policy));
         self.now = now;
         Ok(())
     }
@@ -324,8 +331,10 @@ impl<const KEYS: usize, const FLIGHTS: usize, const WAITERS: usize>
     /// changes nothing. A refresh in flight is untouched either way.
     pub fn forget(&mut self, key: u64) -> Forgetting {
         match self
-            .entry_slot(key)
-            .and_then(|slot| self.entries[slot].take())
+            .entries
+            .iter_mut()
+            .find(|slot| slot.is_some_and(|entry| entry.key == key))
+            .and_then(Option::take)
         {
             Some(_) => Forgetting::Forgotten,
             None => Forgetting::NotHeld,
@@ -346,19 +355,25 @@ impl<const KEYS: usize, const FLIGHTS: usize, const WAITERS: usize>
     pub fn sweep(&mut self, now: Duration, out: &mut [u64]) -> Result<usize, Refusal> {
         self.check(now)?;
         self.now = now;
+        let mut room = out.iter_mut();
         let mut written = 0;
-        for slot in 0..KEYS {
-            if written == out.len() {
-                break;
-            }
-            let Some(entry) = self.entries[slot] else {
+        for slot in &mut self.entries {
+            let Some(entry) = *slot else {
                 continue;
             };
             if entry.policy.state(entry.age_at(now)) == State::Expired
-                && self.lead_slot(entry.key).is_none()
+                && !self
+                    .leads
+                    .iter()
+                    .flatten()
+                    .any(|lead| lead.key == entry.key)
             {
-                self.entries[slot] = None;
-                out[written] = entry.key;
+                let Some(dst) = room.next() else {
+                    break;
+                };
+                *slot = None;
+                *dst = entry.key;
+                // One per slot of `out`, so it cannot pass `out.len()`.
                 written += 1;
             }
         }
@@ -392,20 +407,20 @@ impl<const KEYS: usize, const FLIGHTS: usize, const WAITERS: usize>
     /// Age of the value held for `key` at `now`, if there is metadata for it.
     #[must_use]
     pub fn age(&self, key: u64, now: Duration) -> Option<Duration> {
-        Some(self.entries[self.entry_slot(key)?]?.age_at(now))
+        Some(self.entry(key)?.age_at(now))
     }
 
     /// Fresh, stale or expired at `now`; `None` when the key has no metadata.
     #[must_use]
     pub fn state(&self, key: u64, now: Duration) -> Option<State> {
-        let entry = self.entries[self.entry_slot(key)?]?;
+        let entry = self.entry(key)?;
         Some(entry.policy.state(entry.age_at(now)))
     }
 
     /// Age of the held value if a refresh error at `now` may be answered with it.
     #[must_use]
     pub fn stale_if_error(&self, key: u64, now: Duration) -> Option<Duration> {
-        let entry = self.entries[self.entry_slot(key)?]?;
+        let entry = self.entry(key)?;
         let age = entry.age_at(now);
         entry.policy.if_error(age).then_some(age)
     }
@@ -413,7 +428,7 @@ impl<const KEYS: usize, const FLIGHTS: usize, const WAITERS: usize>
     /// The lease currently refreshing `key`, overdue or not.
     #[must_use]
     pub fn leading(&self, key: u64) -> Option<Lease> {
-        Some(Lease(self.leads[self.lead_slot(key)?]?.lease))
+        Some(Lease(self.lead_of(key)?.lease))
     }
 
     /// The coalesce flight a live lease rides on.
@@ -429,7 +444,14 @@ impl<const KEYS: usize, const FLIGHTS: usize, const WAITERS: usize>
     /// reaped, taken over, or issued in another scope.
     #[must_use]
     pub fn flight(&self, lease: Lease) -> Option<FlightId> {
-        Some(self.held(lease)?.1.flight)
+        if !self.flights.owns(lease.0) {
+            return None;
+        }
+        self.leads
+            .iter()
+            .flatten()
+            .find(|lead| lead.lease == lease.0)
+            .map(|lead| lead.flight)
     }
 
     /// The latest time this refresher accepted.
@@ -494,22 +516,21 @@ impl<const KEYS: usize, const FLIGHTS: usize, const WAITERS: usize>
         }
     }
 
-    fn entry_slot(&self, key: u64) -> Option<usize> {
-        self.entries
-            .iter()
-            .position(|entry| entry.is_some_and(|entry| entry.key == key))
+    fn entry(&self, key: u64) -> Option<&Entry> {
+        self.entries.iter().flatten().find(|entry| entry.key == key)
     }
 
     /// The slot holding `key`, else a free one.
-    fn room_for(&self, key: u64) -> Option<usize> {
-        self.entry_slot(key)
-            .or_else(|| self.entries.iter().position(Option::is_none))
+    fn room_in(entries: &mut [Option<Entry>; KEYS], key: u64) -> Option<&mut Option<Entry>> {
+        let slot = entries
+            .iter()
+            .position(|entry| entry.is_some_and(|entry| entry.key == key))
+            .or_else(|| entries.iter().position(Option::is_none))?;
+        entries.get_mut(slot)
     }
 
-    fn lead_slot(&self, key: u64) -> Option<usize> {
-        self.leads
-            .iter()
-            .position(|lead| lead.is_some_and(|lead| lead.key == key))
+    fn lead_of(&self, key: u64) -> Option<&Lead> {
+        self.leads.iter().flatten().find(|lead| lead.key == key)
     }
 
     const fn over(flights: Coalescer<FLIGHTS, WAITERS>) -> Self {
@@ -521,17 +542,21 @@ impl<const KEYS: usize, const FLIGHTS: usize, const WAITERS: usize>
         }
     }
 
-    /// The slot and record of a live lease. An id this refresher never
+    /// The record and slot of a live lease. An id this refresher never
     /// issued, one from another scope included, is turned away before the
     /// table is read; an id it issued as a waiter or a flight is in no lead.
-    fn held(&self, lease: Lease) -> Option<(usize, Lead)> {
-        if !self.flights.owns(lease.0) {
+    fn held_in<'a>(
+        leads: &'a mut [Option<Lead>; FLIGHTS],
+        flights: &Coalescer<FLIGHTS, WAITERS>,
+        lease: Lease,
+    ) -> Option<(Lead, &'a mut Option<Lead>)> {
+        if !flights.owns(lease.0) {
             return None;
         }
-        self.leads
-            .iter()
-            .enumerate()
-            .find_map(|(slot, lead)| Some((slot, lead.filter(|lead| lead.lease == lease.0)?)))
+        leads.iter_mut().find_map(|slot| {
+            let lead = slot.filter(|lead| lead.lease == lease.0)?;
+            Some((lead, slot))
+        })
     }
 }
 

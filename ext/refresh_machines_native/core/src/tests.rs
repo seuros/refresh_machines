@@ -1,4 +1,3 @@
-#![allow(clippy::expect_used, clippy::panic)]
 extern crate std;
 
 use super::*;

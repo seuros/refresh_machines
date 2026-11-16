@@ -172,4 +172,4 @@ supplies each `retry_after`. Keys are caller-supplied `u64`s. State is in memory
 and scoped to one refresher. Lookups are linear scans over the fixed tables,
 which suits small capacities.
 
-Initial, unstable API.
+Pre-1.0: breaking changes land in minor versions.

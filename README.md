@@ -4,7 +4,7 @@
 
 A freshness officer for Ruby caches. You tell it how old a value was when you stored it and three durations: how long it is fresh, how long it may be served while someone refreshes it, and how long it may be served if the refresh fails. Then you ask before every read. It answers serve it, serve it and refresh in the background, go fetch, or wait for the caller who is already fetching. One caller per key gets the refresh. Everyone else gets an answer.
 
-This is an initial, unstable API. It is a policy core, not a cache: it holds no values, makes no requests, and evicts nothing.
+Pre-1.0: breaking changes land in minor versions. It is a policy core, not a cache: it holds no values, makes no requests, and evicts nothing.
 
 ## Quick Start
 

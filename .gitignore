@@ -1,5 +1,4 @@
 /target/
-Cargo.lock
 Gemfile.lock
 /.bundle/
 /pkg/

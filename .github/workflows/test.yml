@@ -22,7 +22,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: seuros/setup-dictator@master
         with:
-          version: '0.26.0'
+          version: '0.28.1'
       - run: dictator lint --format github .
 
   crates:
@@ -38,6 +38,17 @@ jobs:
             ruby = "4.0"
             rust = { version = "1.99", components = "clippy,rustfmt" }
 
+      - name: Reject path-sourced sibling crates in Cargo.lock
+        run: |
+          ruby -rjson -e '
+            own = JSON.parse(`cargo metadata --no-deps --format-version 1`).fetch("packages").map { |pkg| pkg["name"] }
+            stray = File.read("Cargo.lock").split("[[package]]").filter_map do |pkg|
+              name = pkg[/^name = "([^"]+)"/, 1]
+              next unless name && name.end_with?("-machines") && !own.include?(name)
+              name unless pkg.match?(/^source = "registry/)
+            end
+            abort "Cargo.lock pins sibling crates without a registry source: #{stray.join(", ")}" unless stray.empty?
+          '
       - name: Lint the workspace
         run: cargo clippy --workspace --all-targets -- -D warnings
 

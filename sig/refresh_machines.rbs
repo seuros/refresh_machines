@@ -18,6 +18,18 @@ module RefreshMachines
   # top 16 bits. Use it to route an id to the refresher that issued it.
   def self.scope_of: (Integer id) -> Integer
 
+  # Private native checks behind the Data values: TypeError for the wrong
+  # type, RangeError for a value the core rejects. The value-returning ones
+  # answer their argument unchanged.
+  private def self.__policy: (Integer fresh_for, Integer stale_while_revalidate, Integer stale_if_error) -> nil
+  private def self.__age: (Integer age) -> nil
+  private def self.__until: (Integer until_) -> nil
+  private def self.__lease: (Integer lease) -> Integer
+  private def self.__wait: (Integer waiter, Integer flight) -> nil
+  private def self.__notification: (Integer waiter, Integer flight, Integer key, Notification::outcome outcome) -> nil
+  private def self.__refusal: (refusal refusal) -> refusal
+  private def self.__revalidation: (revalidation revalidation) -> revalidation
+
   class Policy < Data
     attr_reader fresh_for: Integer
     attr_reader stale_while_revalidate: Integer
