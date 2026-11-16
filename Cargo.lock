@@ -230,7 +230,7 @@ checksum = "cca7ad6a7e21e72151d56fe2495a259b5670e204c3adac41ee7ef676ea08117a"
 
 [[package]]
 name = "refresh-machines"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "coalesce-machines",
  "matryona-machines",
@@ -239,7 +239,7 @@ dependencies = [
 
 [[package]]
 name = "refresh_machines_native"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "magnus",
  "matryona-machines",

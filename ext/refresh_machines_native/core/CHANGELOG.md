@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.1](https://github.com/seuros/refresh_machines/compare/refresh-machines-v0.8.0...refresh-machines-v0.8.1) (2026-11-16)
+
+
+### Bug Fixes
+
+* refresher core drops slot indexing for slot references ([f0ebbce](https://github.com/seuros/refresh_machines/commit/f0ebbce39e8414127b8a9ee3718397046ed63b60))
+
 ## [0.8.0](https://github.com/seuros/refresh_machines/compare/refresh-machines-v0.7.0...refresh-machines-v0.8.0) (2026-11-14)
 
 
