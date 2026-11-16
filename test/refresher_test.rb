@@ -48,6 +48,31 @@ class RefresherTest < Minitest::Test
     assert_equal MAX, @refresher.now
   end
 
+  # Rust's `Duration::MAX`, in nanoseconds: the latest instant a refresher reads.
+  DURATION_MAX = (MAX * S) + S - 1
+
+  # Bug: the refresher answered a Backoff#until past 2**64-1 that its own
+  # `now` readers then refused, raising RangeError.
+  def test_every_backoff_retry_atreads_back_as_now
+    @refresher.put(2, MAX, 1, R::Policy.new(1, MAX, MAX))
+    lead = @refresher.decide(2, MAX, MAX)
+    assert_equal 1, @refresher.fail(lead.revalidation.lease, MAX, MAX)
+    retry_at = @refresher.decide(2, MAX, 1).revalidation.until
+    assert_equal 2 * MAX, retry_at
+    assert_equal [MAX + 1, :expired, nil], [@refresher.age(2, retry_at), @refresher.state(2, retry_at),
+                                            @refresher.stale_if_error(2, retry_at)]
+    assert_instance_of R::Fetch, @refresher.decide(2, retry_at, 1)
+    assert_equal retry_at, @refresher.now
+    assert_equal 0, @refresher.reap(retry_at)
+    assert_equal [], @refresher.sweep(retry_at, 10)
+    assert_equal :stored, @refresher.put(3, DURATION_MAX, 0, RULES)
+    [-1, DURATION_MAX + 1].each do |bad|
+      assert_raises(RangeError) { @refresher.decide(1, bad, 1) }
+      assert_raises(RangeError) { @refresher.state(1, bad) }
+    end
+    assert_raises(RangeError) { @refresher.decide(1, DURATION_MAX, 2**64) }
+  end
+
   def test_miss_is_fetched_once_and_waiters_are_woken
     fetch = @refresher.decide(42, 0, 100)
     assert_equal R::Fetch.new(fetch.lease), fetch
@@ -355,7 +380,6 @@ class RefresherTest < Minitest::Test
     assert_raises(TypeError) { @refresher.decide(1, 0.5, 1) }
     assert_raises(TypeError) { @refresher.decide(1, 0, nil) }
     assert_raises(RangeError) { @refresher.decide(-1, 0, 1) }
-    assert_raises(RangeError) { @refresher.decide(1, 2**64, 1) }
     assert_raises(RangeError) { @refresher.decide(1, -1, 1) }
     assert_raises(RangeError) { @refresher.decide(1, 0, 2**64) }
     assert_raises(TypeError) { @refresher.decide(1, 0, 1.0) }
@@ -365,7 +389,7 @@ class RefresherTest < Minitest::Test
     assert_raises(RangeError) { @refresher.reap(-1) }
     assert_raises(TypeError) { @refresher.sweep(nil, 1) }
     assert_raises(TypeError) { @refresher.age(1, 1.0) }
-    assert_raises(RangeError) { @refresher.state(1, 2**64) }
+    assert_raises(RangeError) { @refresher.state(1, DURATION_MAX + 1) }
     assert_raises(TypeError) { @refresher.stale_if_error(1, '1') }
     assert_raises(TypeError) { R::Policy.new(10.0, 5, 20).state(1) }
     assert_raises(TypeError) { @refresher.put(1, 0, 0, [10, 5, 20]) }

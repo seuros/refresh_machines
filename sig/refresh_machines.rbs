@@ -2,9 +2,11 @@ module RefreshMachines
   VERSION: String
 
   # Every instant (`now`, `Backoff#until`) and span (ages, policy windows,
-  # `lead_for`, `retry_after`) is Integer nanoseconds. Arguments must be in
-  # 0..2**64-1; a returned sum may be larger, up to the core's Duration::MAX,
-  # it never wraps.
+  # `lead_for`, `retry_after`) is Integer nanoseconds. A span argument must be
+  # in 0..2**64-1; a `now` argument may be anything in 0..Duration::MAX, so
+  # every instant the refresher answers (a `Backoff#until` past 2**64-1
+  # included) reads back as `now`. A returned sum may be larger than 2**64-1,
+  # up to the core's Duration::MAX; it never wraps.
   #
   # Every Data value validates when built, by the gem or by hand: TypeError
   # for the wrong type, RangeError for a value the core rejects.

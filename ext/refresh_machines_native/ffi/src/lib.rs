@@ -9,7 +9,7 @@ use magnus::{
     Error, Integer, RArray, Ruby, Symbol, TryConvert, Value, prelude::*, typed_data::Obj,
 };
 use matryona_machines::ruby::{
-    Symbols, duration, exact_fields, integer, keep, nanoseconds, symbol,
+    Symbols, duration, exact_fields, instant, integer, keep, nanoseconds, symbol,
 };
 use periscope_machines::scope_of;
 use refresh_machines::{
@@ -153,7 +153,7 @@ impl Refresher {
         lead_for: Value,
     ) -> Result<Value, Error> {
         this.check_frozen()?;
-        let (key, now) = (integer(key, "key")?, duration(now, "now")?);
+        let (key, now) = (integer(key, "key")?, instant(now, "now")?);
         let lead_for = duration(lead_for, "lead_for")?;
         let classes = answers::classes(ruby)?;
         keep(
@@ -177,7 +177,7 @@ impl Refresher {
         policy: Value,
     ) -> Result<Value, Error> {
         this.check_frozen()?;
-        let (lease, now) = (integer(lease, "lease")?, duration(now, "now")?);
+        let (lease, now) = (integer(lease, "lease")?, instant(now, "now")?);
         let (age, policy) = (duration(age, "age")?, Rules::try_convert(policy)?.0);
         let lease = lease_id(ruby, lease)?;
         let outcome = this.core.borrow_mut().store(lease, now, age, policy);
@@ -192,7 +192,7 @@ impl Refresher {
         retry_after: Value,
     ) -> Result<Value, Error> {
         this.check_frozen()?;
-        let (lease, now) = (integer(lease, "lease")?, duration(now, "now")?);
+        let (lease, now) = (integer(lease, "lease")?, instant(now, "now")?);
         let retry_after = duration(retry_after, "retry_after")?;
         let lease = lease_id(ruby, lease)?;
         let outcome = this.core.borrow_mut().fail(lease, now, retry_after);
@@ -213,7 +213,7 @@ impl Refresher {
 
     fn reap(ruby: &Ruby, this: Obj<Self>, now: Value) -> Result<Value, Error> {
         this.check_frozen()?;
-        let now = duration(now, "now")?;
+        let now = instant(now, "now")?;
         let outcome = this.core.borrow_mut().reap(now);
         Ok(match outcome {
             Ok(revoked) => ruby.integer_from_u64(revoked as u64).as_value(),
@@ -230,7 +230,7 @@ impl Refresher {
         policy: Value,
     ) -> Result<Value, Error> {
         this.check_frozen()?;
-        let (key, now) = (integer(key, "key")?, duration(now, "now")?);
+        let (key, now) = (integer(key, "key")?, instant(now, "now")?);
         let (age, policy) = (duration(age, "age")?, Rules::try_convert(policy)?.0);
         let outcome = this.core.borrow_mut().put(key, now, age, policy);
         Ok(done(ruby, outcome, "stored"))
@@ -251,7 +251,7 @@ impl Refresher {
 
     fn sweep(ruby: &Ruby, this: Obj<Self>, now: Value, max: Value) -> Result<Value, Error> {
         this.check_frozen()?;
-        let (now, max) = (duration(now, "now")?, integer(max, "max")?);
+        let (now, max) = (instant(now, "now")?, integer(max, "max")?);
         let room = room(max, KEY_CAPACITY);
         keep(
             ruby,
@@ -319,13 +319,13 @@ impl Refresher {
     }
 
     fn age(ruby: &Ruby, this: &Self, key: Value, now: Value) -> Result<Option<Integer>, Error> {
-        let (key, now) = (integer(key, "key")?, duration(now, "now")?);
+        let (key, now) = (integer(key, "key")?, instant(now, "now")?);
         let age = this.core.borrow().age(key, now);
         Ok(age.map(|age| nanoseconds(ruby, age)))
     }
 
     fn state(ruby: &Ruby, this: &Self, key: Value, now: Value) -> Result<Option<Symbol>, Error> {
-        let (key, now) = (integer(key, "key")?, duration(now, "now")?);
+        let (key, now) = (integer(key, "key")?, instant(now, "now")?);
         let state = this.core.borrow().state(key, now);
         Ok(state.map(|state| state_name(ruby, state)))
     }
@@ -336,7 +336,7 @@ impl Refresher {
         key: Value,
         now: Value,
     ) -> Result<Option<Integer>, Error> {
-        let (key, now) = (integer(key, "key")?, duration(now, "now")?);
+        let (key, now) = (integer(key, "key")?, instant(now, "now")?);
         let age = this.core.borrow().stale_if_error(key, now);
         Ok(age.map(|age| nanoseconds(ruby, age)))
     }
