@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.4](https://github.com/seuros/refresh_machines/compare/refresh_machines/v0.7.3...refresh_machines/v0.7.4) (2026-11-16)
+
+
+### Bug Fixes
+
+* accept every age the gem returns ([a09310d](https://github.com/seuros/refresh_machines/commit/a09310d1bed8a0c08e8f78c4e69ad94e459f8fd2))
+
 ## [0.7.3](https://github.com/seuros/refresh_machines/compare/refresh_machines/v0.7.2...refresh_machines/v0.7.3) (2026-11-16)
 
 
