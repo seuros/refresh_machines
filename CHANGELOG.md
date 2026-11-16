@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.3](https://github.com/seuros/refresh_machines/compare/refresh_machines/v0.7.2...refresh_machines/v0.7.3) (2026-11-16)
+
+
+### Bug Fixes
+
+* accept every instant the gem returns ([9420a3d](https://github.com/seuros/refresh_machines/commit/9420a3d73340ad8d7d4299325ac616c91c6fd21c))
+
 ## [0.7.2](https://github.com/seuros/refresh_machines/compare/refresh_machines/v0.7.1...refresh_machines/v0.7.2) (2026-11-16)
 
 
