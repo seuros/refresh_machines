@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.2](https://github.com/seuros/refresh_machines/compare/refresh_machines/v0.7.1...refresh_machines/v0.7.2) (2026-11-16)
+
+
+### Bug Fixes
+
+* fix wrapped classes at load so building a value runs no Ruby ([d8531d6](https://github.com/seuros/refresh_machines/commit/d8531d6f7180c96632fe8f3fe19b914e840371d0))
+
 ## [0.7.1](https://github.com/seuros/refresh_machines/compare/refresh_machines/v0.7.0...refresh_machines/v0.7.1) (2026-11-16)
 
 
