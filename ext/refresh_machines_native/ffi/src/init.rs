@@ -4,6 +4,7 @@ use crate::{
     policy_while_revalidate, scope_of_id, values,
 };
 use magnus::{Error, Ruby, function, method, prelude::*};
+use matryona_machines::ruby::Class;
 
 #[magnus::init]
 fn init(ruby: &Ruby) -> Result<(), Error> {
@@ -59,5 +60,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     class.define_method("capacity", function!(Refresher::capacity, 0))?;
     class.define_method("flight_capacity", function!(Refresher::flight_capacity, 0))?;
     class.define_method("waiter_capacity", function!(Refresher::waiter_capacity, 0))?;
-    Ok(())
+    // `new`, `with_scope` and `resumed` answer a Refresher: its class is
+    // fixed now, so building one never runs `Object.const_get`.
+    Class::pin_wrapped::<Refresher>(ruby, class).map(drop)
 }
